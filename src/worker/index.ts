@@ -1,14 +1,3 @@
-export default {
- async fetch(request, env, ctx) {
-
-   const country = request.cf?.country;
-
-   if(country && !["IR","DE"].includes(country)){
-       return new Response(
-          "Access denied",
-          {status:403}
-       );
-   }
 import { normalizeThemeData, THEME_MAX_BYTES } from '../theme-schema';
 import { ALLOWED_LOCATION_HINTS, type Env, type SSHConnectionConfig } from '../types';
 import {
