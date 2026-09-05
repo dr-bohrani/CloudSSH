@@ -77,28 +77,28 @@
 }
 
 html[data-ui-shape="square"] {
-  --control-radius: 2px;
-  --card-radius: 0px;
-  --modal-radius: 0px;
+  --control-radius: calc(2px * var(--radius-scale, 1));
+  --card-radius: calc(0px * var(--radius-scale, 1));
+  --modal-radius: calc(0px * var(--radius-scale, 1));
   --terminal-frame-gap: 4px;
 }
 
 html[data-ui-shape="rounded"] {
-  --control-radius: 6px;
-  --card-radius: 9px;
-  --modal-radius: 12px;
+  --control-radius: calc(6px * var(--radius-scale, 1));
+  --card-radius: calc(9px * var(--radius-scale, 1));
+  --modal-radius: calc(12px * var(--radius-scale, 1));
   --terminal-frame-gap: 7px;
 }
 
 html[data-ui-shape="soft"] {
-  --control-radius: 10px;
-  --card-radius: 15px;
-  --modal-radius: 18px;
+  --control-radius: calc(10px * var(--radius-scale, 1));
+  --card-radius: calc(15px * var(--radius-scale, 1));
+  --modal-radius: calc(18px * var(--radius-scale, 1));
   --terminal-frame-gap: 10px;
 }
 
 html[data-ui-density="compact"] {
-  --font-size-scale: 0.94;
+  --font-size-scale: calc(0.94 * var(--type-scale, 1));
   --space-scale: 0.84;
   --control-padding-x: 0.62rem;
   --control-padding-y: 0.36rem;
@@ -108,7 +108,7 @@ html[data-ui-density="compact"] {
 }
 
 html[data-ui-density="comfortable"] {
-  --font-size-scale: 1;
+  --font-size-scale: calc(1 * var(--type-scale, 1));
   --space-scale: 1;
   --control-padding-x: 0.78rem;
   --control-padding-y: 0.5rem;
@@ -118,7 +118,7 @@ html[data-ui-density="comfortable"] {
 }
 
 html[data-ui-density="spacious"] {
-  --font-size-scale: 1.04;
+  --font-size-scale: calc(1.04 * var(--type-scale, 1));
   --space-scale: 1.12;
   --control-padding-x: 0.92rem;
   --control-padding-y: 0.62rem;
@@ -156,6 +156,19 @@ html[data-ui-shadow="elevated"] {
   --surface-blur: 10px;
 }
 
+/* V3：表面模糊独立档位，覆盖 shadow 预设派生值（后置规则同优先级胜出） */
+html[data-ui-blur='none'] {
+  --surface-blur: 0px;
+}
+
+html[data-ui-blur='subtle'] {
+  --surface-blur: 6px;
+}
+
+html[data-ui-blur='strong'] {
+  --surface-blur: 16px;
+}
+
 html[data-ui-motion="none"] {
   --motion-fast: 0ms;
   --motion-normal: 0ms;
@@ -182,6 +195,65 @@ body {
   background-color: var(--bg);
   color: var(--text);
   min-height: 100vh;
+}
+
+/* ==================== Theme V3：背景层 / 效果 / 版式缩放 ==================== */
+
+/* 背景层：固定全屏伪元素承载渐变栈；--app-bg-stack 为 none 时与 V2 纯色完全一致 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--app-bg-stack, none);
+}
+
+/* 环境背景漂移：主题显式声明 drift 时启用；motion=none 与系统级减少动态时停止 */
+html[data-bg-animation='drift'] body::before {
+  background-size: 200% 200%;
+  animation: theme-bg-drift 40s ease-in-out infinite alternate;
+}
+
+html[data-ui-motion='none'] body::before {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-bg-animation='drift'] body::before {
+    animation: none;
+  }
+}
+
+@keyframes theme-bg-drift {
+  0% {
+    background-position: 0% 0%;
+  }
+  100% {
+    background-position: 100% 100%;
+  }
+}
+
+/* 噪点：内联 feTurbulence 纹理（静态资源，非主题数据），强度驱动透明度 */
+html[data-fx-noise='on'] body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: var(--fx-noise-opacity, 0.05);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* 辉光：效果开启时卡片/按钮静止态即带强调辉光（hover 态全主题通用不变） */
+html[data-fx-glow='on'] .server-card {
+  box-shadow:
+    var(--shadow-card),
+    0 4px calc(24px * var(--fx-glow-strength, 0.6)) var(--accent-glow);
+}
+
+html[data-fx-glow='on'] .cyber-button {
+  box-shadow: 0 0 calc(12px * var(--fx-glow-strength, 0.6)) var(--accent-glow);
 }
 
 .language-toggle {
@@ -298,12 +370,17 @@ body.terminal-active {
   cursor: crosshair;
 }
 
-html:not([data-ui-style="cyberpunk"]) .scanlines,
-html:not([data-ui-style="cyberpunk"]) .scanline {
+/* V3 效果注册表：扫描线/闪烁按 fx 开关门控（取代旧的 style=cyberpunk 硬编码） */
+html:not([data-fx-scanline='on']) .scanlines,
+html:not([data-fx-scanline='on']) .scanline {
   display: none;
 }
 
-html:not([data-ui-style="cyberpunk"]) .flicker {
+html[data-fx-scanline='on'] .scanlines {
+  opacity: var(--fx-scanline-opacity, 1);
+}
+
+html:not([data-fx-flicker='on']) .flicker {
   animation: none;
   display: none;
 }
@@ -352,7 +429,7 @@ html:not([data-ui-style="cyberpunk"]) .flicker {
 }
 
 .flicker {
-  animation: flicker 0.15s infinite;
+  animation: flicker var(--fx-flicker-speed, 0.15s) infinite;
   pointer-events: none;
   position: fixed;
   top: 0;
@@ -1458,6 +1535,16 @@ select optgroup {
   max-width: 120px;
 }
 
+.tab-rename-input {
+  max-width: 120px;
+  height: 20px;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 20px;
+  border-radius: 2px;
+  outline: none;
+}
+
 .network-latency-item {
   display: inline-flex;
   align-items: center;
@@ -1749,6 +1836,9 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
 
 #agent-panel {
   min-width: 280px;
+  width: min(clamp(420px, 40vw, 600px), 100%);
+  max-width: 100%;
+  height: 100%;
 }
 
 .agent-mobile-back {
@@ -2291,6 +2381,28 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
   animation: tp-pulse 1.5s ease-in-out infinite;
 }
 
+/* ==================== SFTP 操作栏（全局：桌面面板 420~600px、移动/平板全屏） ====================
+   按钮禁止压缩换行：WebKit 对嵌套 flex 的内在尺寸计算会把 CJK 标签
+   压成单字竖排；空间不足时整栏横向滚动（滚动条隐藏，触摸可滑） */
+.sftp-panel-actions {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.sftp-panel-actions::-webkit-scrollbar {
+  display: none;
+}
+
+.sftp-panel-actions button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.sftp-panel-actions button > span[data-i18n] {
+  white-space: nowrap;
+}
+
 /* ==================== Responsive Adaptations ==================== */
 
 @media (max-width: 767px), (max-width: 1180px) and (pointer: coarse) {
@@ -2667,6 +2779,13 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
     padding-bottom: 0;
   }
 
+  /* 移动端打开 AI Agent 时隐藏终端快捷键工具栏，防止遮挡 Agent 底部输入框与操作区 */
+  body.agent-panel-open .mobile-terminal-toolbar,
+  body:has(#agent-panel:not([style*="display: none"])) .mobile-terminal-toolbar,
+  #terminal-section:has(#agent-panel:not([style*="display: none"])) .mobile-terminal-toolbar {
+    display: none !important;
+  }
+
   .mobile-terminal-toolbar-scroll {
     display: flex;
     width: 100%;
@@ -2750,6 +2869,28 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
     display: none;
   }
 
+  .agent-quick-chip {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .agent-send-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .agent-md-content .agent-md-code-action {
+    min-height: 30px;
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  .agent-confirm button {
+    min-height: 38px;
+    font-size: 12px;
+  }
+
   .sftp-panel-header {
     padding-top: env(safe-area-inset-top);
     min-height: calc(48px + env(safe-area-inset-top));
@@ -2769,19 +2910,8 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
     padding-right: max(8px, env(safe-area-inset-right));
   }
 
-  .sftp-panel-actions {
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: none;
-  }
-
-  .sftp-panel-actions::-webkit-scrollbar {
-    display: none;
-  }
-
   .sftp-panel-actions button {
     min-height: 40px;
-    flex: 0 0 auto;
   }
 
   .ask-ai-selection-float {
@@ -2855,4 +2985,321 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
   background: var(--accent-bg);
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* SFTP 在线编辑器（CodeMirror 模态） */
+.remote-editor {
+  --editor-color: var(--accent);
+  width: min(1100px, calc(100vw - 24px));
+  max-width: none;
+  height: min(
+    760px,
+    calc(
+      var(--visual-viewport-height) -
+      24px -
+      env(safe-area-inset-top) -
+      env(safe-area-inset-bottom)
+    )
+  );
+  margin: auto;
+  padding: 0;
+  color: var(--on-surface);
+  background: transparent;
+  border: 0;
+  overflow: visible;
+}
+
+.remote-editor::backdrop {
+  background: var(--modal-overlay);
+  backdrop-filter: blur(var(--surface-blur));
+  animation: app-dialog-backdrop-in var(--motion-normal) ease-out;
+}
+
+.remote-editor[open] .remote-editor__panel {
+  animation: app-dialog-in var(--motion-normal) ease-out;
+}
+
+.remote-editor__panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-surface);
+  border: 1px solid color-mix(in srgb, var(--editor-color) 50%, var(--border));
+  border-radius: var(--modal-radius);
+  box-shadow: var(--shadow-modal);
+  overflow: hidden;
+}
+
+.remote-editor__header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 16px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+.remote-editor__icon {
+  color: var(--editor-color);
+  font-size: 20px;
+  font-variation-settings: "FILL" 1;
+}
+
+.remote-editor__titles {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.remote-editor__title {
+  color: var(--on-surface);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-editor__path {
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-editor__close {
+  display: flex;
+  flex-shrink: 0;
+  padding: 4px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  transition: color var(--motion-fast) ease;
+}
+
+.remote-editor__close .material-symbols-outlined {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.remote-editor__close:hover {
+  color: var(--on-surface);
+}
+
+.remote-editor__notice {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 16px 0;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--accent-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+}
+
+.remote-editor__notice[hidden] {
+  display: none;
+}
+
+.remote-editor__body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.remote-editor__footer {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border);
+}
+
+.remote-editor__status {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-editor__actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 10px;
+}
+
+.remote-editor__button {
+  min-width: 86px;
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  border-radius: var(--control-radius);
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) ease,
+    color var(--motion-fast) ease,
+    border-color var(--motion-fast) ease;
+}
+
+.remote-editor__button:focus-visible {
+  outline: 2px solid var(--editor-color);
+  outline-offset: 2px;
+}
+
+.remote-editor__button--cancel {
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+}
+
+.remote-editor__button--cancel:hover {
+  color: var(--on-surface);
+  border-color: var(--text-muted);
+}
+
+.remote-editor__button--save {
+  color: var(--bg);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.remote-editor__button--save:hover {
+  filter: brightness(1.12);
+}
+
+.remote-editor__button--save:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: none;
+}
+
+.remote-editor__button--wrap {
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+}
+
+.remote-editor__button--wrap:hover {
+  color: var(--on-surface);
+  border-color: var(--text-muted);
+}
+
+.remote-editor__button--wrap[aria-pressed='true'] {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+
+/* CodeMirror 语法高亮：classHighlighter 令牌 → 主题变量，跟随亮/暗/自定义主题 */
+.remote-editor .tok-keyword,
+.remote-editor .tok-atom,
+.remote-editor .tok-bool,
+.remote-editor .tok-meta {
+  color: var(--accent-secondary);
+  font-weight: 600;
+}
+
+.remote-editor .tok-string,
+.remote-editor .tok-regexp,
+.remote-editor .tok-escape {
+  color: var(--accent);
+}
+
+.remote-editor .tok-number {
+  color: var(--accent-secondary-light);
+}
+
+.remote-editor .tok-typeName,
+.remote-editor .tok-className,
+.remote-editor .tok-namespace,
+.remote-editor .tok-macroName {
+  color: var(--accent-secondary-light);
+}
+
+.remote-editor .tok-comment {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.remote-editor .tok-operator,
+.remote-editor .tok-punctuation {
+  color: var(--text-muted);
+}
+
+.remote-editor .tok-tag,
+.remote-editor .tok-attributeName {
+  color: var(--accent-secondary);
+}
+
+.remote-editor .tok-heading,
+.remote-editor .tok-link {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.remote-editor .tok-invalid {
+  color: var(--error);
+}
+
+/* 移动端适配：窄屏近全屏 + 安全区 + 触摸目标（对齐 auth-challenge-dialog 先例） */
+@media (max-width: 520px) {
+  .remote-editor {
+    width: calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right));
+    height: calc(
+      var(--visual-viewport-height) -
+      16px -
+      env(safe-area-inset-top) -
+      env(safe-area-inset-bottom)
+    );
+  }
+
+  .remote-editor__header {
+    padding: 9px 12px;
+  }
+
+  .remote-editor__close {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    margin: -6px;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .remote-editor__footer {
+    padding: 9px 12px;
+  }
+
+  .remote-editor__button {
+    min-width: 84px;
+    padding: 10px 12px;
+  }
+}
+
+/* iOS 规避：contenteditable 字号 < 16px 时聚焦会强制缩放页面；
+   触屏/窄屏下编辑器字号提到 16px，同时搜索面板输入框同理 */
+@media (pointer: coarse), (max-width: 520px) {
+  .remote-editor .cm-editor {
+    font-size: 16px;
+  }
+
+  .remote-editor .cm-panel input,
+  .remote-editor .cm-panel button {
+    font-size: 16px;
+  }
 }

@@ -51,11 +51,11 @@ test('内置主题切换 UI 风格但保持服务器列表结构稳定', async (
   await expect(card).toHaveCount(1);
   await expect(grid).toHaveClass(/grid-cols-1/);
 
-  await selector.selectOption('glacier');
+  await selector.selectOption('apple');
   await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'soft');
   await expect(page.locator('html')).toHaveAttribute('data-component-card', 'elevated');
   await expect(card).toHaveCSS('border-radius', '15px');
-  await expect(terminalSelector).toHaveValue('glacier');
+  await expect(terminalSelector).toHaveValue('apple');
 
   await selector.selectOption('gruvbox');
   await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'dense');
@@ -77,6 +77,24 @@ test('内置主题切换 UI 风格但保持服务器列表结构稳定', async (
     'color',
     'rgb(74, 246, 38)'
   );
+
+  // V3：CRT 与 Glass 内置主题携带背景/效果/模糊配置
+  await selector.selectOption('crt');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'crt');
+  await expect(page.locator('html')).toHaveAttribute('data-ui-style', 'cyberpunk');
+  await expect(page.locator('html')).toHaveAttribute('data-fx-scanline', 'on');
+  await expect(page.locator('html')).toHaveAttribute('data-fx-glow', 'on');
+  await expect(terminalSelector).toHaveValue('crt');
+
+  await selector.selectOption('glass');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'glass');
+  await expect(page.locator('html')).toHaveAttribute('data-ui-blur', 'strong');
+  await expect(page.locator('html')).toHaveAttribute('data-bg-animation', 'drift');
+  await expect(page.locator('html')).toHaveAttribute('data-fx-glow', 'on');
+  await expect(card).toHaveCSS('border-radius', '21px');
+  expect(
+    await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundImage)
+  ).toContain('radial-gradient');
 });
 
 test('云端主题恢复不阻塞用户空间首屏，并避免覆盖加载期间的用户选择', async ({ page }) => {
@@ -140,7 +158,7 @@ test('终端四周留白按形状收窄并为圆角保留安全间距', async ({
   await expect(terminalMain).toHaveCSS('padding', '7px');
   await expect(terminalWrapper).toHaveCSS('border-radius', '9px');
 
-  await selector.selectOption('glacier');
+  await selector.selectOption('apple');
   await expect(terminalMain).toHaveCSS('padding', '10px');
   await expect(terminalWrapper).toHaveCSS('border-radius', '15px');
 });

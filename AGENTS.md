@@ -7,6 +7,7 @@
   - package.json (依赖、脚本命令)
   - src/types.ts (Env 接口、类型定义)
   - biome.json (代码格式与 lint 约定)
+  - .pi-lens.json (pi-lens 项目策略：规则禁用与豁免口径，见 #31)
 -->
 
 ## Project Overview
@@ -30,6 +31,9 @@ src/
 │   ├── durable-object.ts  # SSHSessionDO - manages SSH sessions
 │   ├── share-do.ts    # SSHShareDO - one-time capability lifecycle and share-only audit log
 │   ├── ssh-session.ts     # SSH session logic, multi-channel routing, SFTP handling
+│   ├── ssh-interactive-auth.ts # RFC 4256 键盘交互认证状态机（挑战/超时/响应组包解耦）
+│   ├── ssh-detached-buffer.ts   # 弱网断线保持 128KB 有界缓冲队列与重连补偿
+│   ├── share-audit-writer.ts    # 分享审计事件投递、防抖刷新与关闭留痕
 │   ├── direct-tcpip-stream.ts # RFC 4254 direct-tcpip 背压字节流，用于嵌套 SSH 跳板链
 │   ├── sftp-handler.ts    # SFTP protocol ops, task queue, concurrent download, upload tracking
 │   ├── user-db.ts    # UserDBDO - user/server/命令片段存储（含标签、OS、跳板关系与片段持久化）
@@ -63,7 +67,7 @@ src/
 │   ├── utils.ts      # Binary utilities
 │   ├── sftp.ts       # SFTP v3 client implementation
 │   └── sftp-types.ts # SFTP protocol constants and types
-├── theme-schema.ts   # Theme V2 shared validation, allowlists, enums, and size limits
+├── theme-schema.ts   # Theme V3 shared validation（外观/背景/效果/版式模块、白名单与读性遮罩下限）
 ├── snippet-schema.ts # Command snippet shared validation, limits, and normalization (UserDBDO + localStorage)
 └── types.ts          # Shared TypeScript type definitions
 
@@ -81,23 +85,30 @@ frontend/
 │   ├── os-icons.ts        # 操作系统品牌图标（内嵌 simple-icons SVG）
 │   ├── port.ts            # 端口解析与 1-65535 校验
 │   ├── regions.ts         # DO locationHint 区域选项共享数据（Auto + 白名单）
-│   ├── theme.ts           # Theme V2 内置主题、UI CSS 变量与外观预设
+│   ├── theme.ts           # Theme V3 内置主题、UI CSS 变量、外观预设、背景/效果合成与版式缩放
 │   ├── auth-challenge-dialog.ts # RFC 4256 multi-round authentication prompt UI
 │   ├── mobile-terminal.ts # Mobile viewport, shortcut toolbar, clipboard and landscape controller
 │   ├── mobile-input.ts    # Pure iOS IME diff and one-shot modifier helpers
 │   ├── known-hosts.ts     # 已验证主机指纹消息校验、本地/云端 TOFU 持久化
-│   ├── tab-manager.ts     # Tab manager (multi-session terminal/SFTP/Agent coordinator, 返回终端按钮联动)
-│   ├── sftp-panel.ts      # SFTP file manager UI (multi-select, batch actions, queue, cancel)
+│   ├── tab-manager.ts     # Tab manager (多会话协调、双击重命名、右键上下文菜单、返回终端联动)
+│   ├── sftp-panel.ts      # SFTP file manager UI (多选/批量/面包屑导航/多维排序/新建文件)
+│   ├── sftp-editor-session.ts # SFTP 在线编辑协调器（挂载、只读呈现、冲突比对与覆盖上传）
+│   ├── sftp-dialogs.ts    # SFTP 交互对话框（新建文件/目录、重命名、删除与名称校验）
+│   ├── sftp-transfer.ts   # SFTP 传输控制器与异步同步原语（UploadWaiter / Deferred）
+│   ├── sftp-helpers.ts    # SFTP 面包屑解析、多维排序与格式化辅助纯函数
+│   ├── code-editor.ts     # CodeMirror 6 modal wrapper for SFTP online editing (theme-variable highlighting)
+│   ├── editor-content.ts  # Online editing pure helpers (binary sniff, UTF-8/GB18030 decode, BOM/EOL round-trip)
 │   ├── sftp-selection.ts  # Pure multi-selection state model
 │   ├── auth-form.ts       # Auth form & encrypted anonymous credentials storage/autofill
-│   ├── server-list.ts     # Server UI (tags, search, responsive 9/6/3-card pagination, CRUD/connect)
+│   ├── server-list.ts     # Server UI (tags, search, responsive 9/6/3-card pagination, CRUD/connect/duplicate)
 │   ├── share-manager.ts   # Owner UI for creating, revoking, and auditing one-time shares
 │   ├── share-session.ts   # Public one-time share landing and claim flow
 │   ├── agent/
-│   │   ├── agent-panel.ts # AI assistant sidebar (context attachments, streaming, Markdown, confirmations)
+│   │   ├── agent-panel.ts # AI assistant sidebar (context attachments, streaming, Markdown, confirmations, quick prompt chips)
 │   │   ├── code-actions.ts # Agent 代码块语言归一化与 Shell 单行命令可填性判定
 │   │   └── terminal-selection-context.ts # Selection snapshots and untrusted-data prompt boundary
-│   ├── snippet-manager.ts # 命令片段库面板（云端/本地双后端、填入/填入并执行、编辑/删除）
+│   ├── snippet-manager.ts # 命令片段库面板（云端/本地双后端、参数占位符录入、搜索/复制、填入/填入并执行、编辑/删除）
+│   ├── snippet-variables.ts # 命令片段 {{var}} 参数占位符提取与安全替换纯函数
 │   ├── snippet-store.ts   # 片段存储层（RemoteSnippetStore + LocalSnippetStore + 错误映射）
 │   ├── ai-config.ts       # AI model configuration modal
 │   ├── i18n/
@@ -161,6 +172,8 @@ pnpm run verify
 # Install frontend dependencies (separate from root)
 cd frontend && pnpm install
 ```
+
+> **供应链策略约束**：`pnpm-workspace.yaml` 已启用 `blockExoticSubdeps` / `minimumReleaseAge: 10080`（7 天）/ `trustPolicy: no-downgrade`。frozen-lockfile 部署不受影响；但未来**升级依赖到刚发布（<7 天）的新版本会安装失败**（`minimumReleaseAge` 拦截），需届时再决定放宽或等待版本成熟，勿把该报错当作环境问题排查。
 
 ## Critical Build Process
 
@@ -305,7 +318,7 @@ release: 发布 vX.Y.Z <主题>版本（如 `release: 发布 v1.10.2 工作流�
 13. **SFTP selection model** - file selection supports single, Cmd/Ctrl toggle, Shift range and select-all. Batch download reuses the sequential download queue; batch delete waits for all delete/rmdir results before refreshing.
 14. **Agent terminal selection context** - “Ask AI assistant” attaches one immutable selection snapshot per tab and never sends it by itself. New selections replace the pending snapshot; successful sends and session teardown clear it. Preserve the untrusted-data/non-authorization boundary in `terminal-selection-context.ts`.
 15. **Region inference privacy** - Saving or changing a Cloudflare-direct server host calls the third-party IPinfo service and persists the inferred locationHint. Servers with `jump_server_id` are downstream nodes: never query their hosts, ignore and clear their own region hints, and infer once if they later become direct Auto entries. Keep the provider name and disclosure synchronized across README/code comments; failures must continue to fall back to Cloudflare's default placement.
-16. **Theme editor ownership** - The full visual editor and JSON export live in `docs/theme-editor/index.html` for GitHub Pages and never authenticate against CloudSSH. `scripts/sync-theme-editor.js` keeps its built-in colors and resolved appearance presets aligned with `frontend/src/theme.ts`; the application and Worker share Theme V2 validation through `src/theme-schema.ts`. The application only imports JSON themes and synchronizes the single custom-theme slot through `/api/user/theme` for signed-in users; later imports replace the previous theme, while anonymous themes remain local.
+16. **Theme editor ownership** - The full visual editor and JSON export live in `docs/theme-editor/index.html` for GitHub Pages and never authenticate against CloudSSH. `scripts/sync-theme-editor.js` keeps its built-in colors, resolved appearance presets, background layers and effect presets aligned with `frontend/src/theme.ts`; the application and Worker share Theme V3 validation through `src/theme-schema.ts` (appearance enums + V3 background/effects/typography modules, all declarative and whitelist-validated). The application only imports JSON themes and synchronizes the single custom-theme slot through `/api/user/theme` for signed-in users; later imports replace the previous theme, while anonymous themes remain local. V3 effect/background layers are driven by CSS variables and data attributes only — no user CSS/JS is ever evaluated, and background gradients compose exclusively from whitelist-validated color stops.
 17. **Mobile terminal input and recovery** - Mobile shortcuts and the iOS keyCode 229 fallback must continue through `TrzszFilter.processTerminalInput`; never send them directly to the WebSocket, and do not permit any terminal input until `shell_ready`. For iOS IME fallback, capture the textarea baseline on `keydown=229` but flush on the corresponding `keyup` regardless of its key code, since Safari commonly reports 32 for Space and 0 for punctuation; xterm `onData` remains authoritative to prevent duplicate input. Keep the explicit mobile selection mode isolated from desktop mouse auto-copy, map touch drags through xterm's public selection API instead of native long-press selection, and debounce visual viewport refits. Enable background-return visibility recovery only when the device has touch points and a coarse primary pointer, so desktop tab changes do not emit recovery logs or probes. A mobile background return must validate the WebSocket with a bounded ID-matched heartbeat instead of trusting `readyState`; anonymous reconnects may reuse only the current in-memory config, while saved-server reconnects must request a fresh one-time token from `/api/servers/:id/connect`. Never report a connection as online before the replacement Shell is ready.
 18. **Saved-server OS detection** - Run OS detection only for signed-in saved servers without a persisted result, through a separate non-blocking SSH exec channel after Shell readiness. Never persist `unknown`; host or port changes must clear the stored OS, and background metadata updates must not change `updated_at` or server ordering. Keep backend canonical keys synchronized with frontend labels/icon fallbacks.
 19. **Keyboard-interactive authentication** - Begin user authentication with the RFC 4252 `none` probe and choose only methods advertised by the server, while retaining the bounded compatibility fallback for servers that omit the list. RFC 4256 challenges are event-driven during the SSH auth state. Keep method-specific message type 60 disambiguated by the active auth method, use `partial_success` to advance bounded multi-factor stages, and only fall back without partial success when the server no longer offers the configured primary method. Bind browser responses and `auth_challenge_ack` display acknowledgements to one random challenge ID and originating WebSocket, distinguish an undisplayed challenge from an acknowledged but unanswered challenge, never log responses, clear pending challenges on timeout/reconnect/close, require explicit user action before substituting a stored password, and close authentication timeouts normally so older frontends cannot reconnect repeatedly. Treat ordinary server-side credential rejection as an expected close rather than WebSocket error 1011.
@@ -315,7 +328,9 @@ release: 发布 vX.Y.Z <主题>版本（如 `release: 发布 v1.10.2 工作流�
 23. **SSH host-key TOFU** - Never publish or persist a first-seen/replacement fingerprint before its KEX host-key signature succeeds. A changed fingerprint must close normally without automatic retry, display the old/new values for explicit user confirmation, and replace only the exact route-scoped identity. Saved-server confirmation must update the cloud record before requesting a fresh one-time token; anonymous confirmation may update only the current in-memory config and local record. Cancellation or persistence failure must leave the previous trust record intact.
 24. **Command snippets** - 按 `user_id` 行级隔离存于 UserDBDO（名称≤50、命令≤2000、每用户≤100 条），所有 CRUD 均 `WHERE user_id = ?`；匿名用户降级 `localStorage`（`cloudssh_snippets`）。插入默认不自动回车（`insertSnippet` 单行走 `fillInput`、多行走 `xterm paste`），一次性分享会话中隐藏入口。
 
-25. **One-time SSH sharing** - Sharing is disabled unless `ENABLE_SSH_SHARING=true`. A link contains only a 256-bit capability, persists only its hash, can be claimed once, and exchanges for a one-minute connection ticket. Creation requires route-scoped verified host fingerprints for the target and every jump hop. Share policy is issued only by SSHShareDO/UserDBDO and must disable Agent, OS detection, host-key mutation, metadata mutation, keyboard-interactive auth, and reconnect while permitting only Terminal and optional SFTP. Record lifecycle, structured SFTP requests/results, and terminal output (not raw keystrokes); stop the session if audit storage fails or reaches 5 MiB/5000 events. Revocation and expiry must close the live SSHSessionDO. Preserve completed audit metadata if its saved-server record is later deleted.
+25. **One-time SSH sharing** - Sharing is disabled unless `ENABLE_SSH_SHARING=true`. A link contains only a 256-bit capability, persists only its hash, can be claimed once, and exchanges for a one-minute connection ticket. Creation requires route-scoped verified host fingerprints for the target and every jump hop. Share policy is issued only by SSHShareDO/UserDBDO and must disable Agent, OS detection, host-key mutation, metadata mutation, keyboard-interactive auth, and reconnect while permitting only Terminal and optional SFTP. Record lifecycle, structured SFTP requests/results, and terminal output (not raw keystrokes); stop the session if audit storage fails or reaches 5 MiB/5000 events. Revocation and expiry must close the live SSHSessionDO — including detached sessions held in the 60s re-attach grace window (`detachedSessions`), which are NOT reachable through `this.sessions`. Preserve completed audit metadata if its saved-server record is later deleted.
+
+    **Grace-period re-attach（分享会话秒级恢复）**：全新完整重连仍被禁止，但认领设备在断线宽限期内的无缝 reattach 允许，且必须满足：① claim 时绑定设备公钥（`frontend/src/device-identity.ts` 生成的非可导出 ECDSA P-256 密钥，SPKI base64url 经 ShareDO 持久化，Worker 服务端链路下发、客户端不可注入；导出前含持久化回读校验——无痕模式等存储不可靠的环境不绑定公钥，此类分享会话不具备断线恢复资格：断线后即时终结并在终端说明原因）；② 恢复请求携带对 `src/share-resume-schema.ts` 规范串的挑战签名，nonce 验签前单次消费防重放；③ 每次成功恢复轮换 resume token（旧 token 降级为“上一代”、仍可容忍一次携旧值重试以覆盖轮换帧丢失，设备签名与 nonce 校验不豁免）；④ 到达 `sessionExpiresAt` 或被撤销时立即终结保持中的会话并拒绝恢复；⑤ 拒绝事件写入 `share.resume_denied` 审计。已知理论边界：原设备持有人实时中继签名不可由客户端方案阻止，靠全程审计追责兜底。前端分享连接必须走 resume-only 路径（`connectWithWebSocket(..., { resumeOnly: true })`）；重试按指数退避铺满整个断线保持窗口（`SHARE_RESUME_RETRY_WINDOW_MS`，给用户留出切换网络的时间），窗口耗尽或凭据彻底失效时宣告分享结束而非回退完整重连。审计明细默认长期留存：分享者可在终态后整体清空（写入墓碑事件保留追责线索）或由系统在保留期后自动清理——保留期默认 90 天、可在创建分享时自定义（7–365 天）；手动清空会同步取消该排期。清理墓碑事件（`share.audit_purged`/`share.audit_auto_purged`）不进入常规审计列表；SSHShareDO 清理时将留痕（时间与手动/自动方式）同步至所有者 UserDBDO 的 `ssh_shares.audit_purged_at`/`audit_purge_type` 列，管理端在集中的「审计清理记录」折叠区展示全部清理操作，已清理的分享等同删除效果——不再提供查看审计入口。接收者无任何删除能力。**已知边界**：留痕同步（`notifyOwnerAuditPurged`）为尽力而为——部署窗口期旧版 UserDBDO 不认 `/internal/shares/:id/audit-purged` 路由时，清理成功但 `audit_purged_at` 留 NULL，前端会将该分享按“审计仍在”展示（点击为空审计）；审计明细已删不可回滚，仅记录日志，前端展示以 `audit_purged_at` 为准。
 
 26. **DNS rebinding SSRF defense** - Address-string checks (`isBlockedHost` / `validateBaseUrl`) alone can be bypassed by domains resolving to private/reserved IPs. `src/worker/dns-check.ts` resolves hostnames via DNS-over-HTTPS (1.1.1.1) and checks every resolved IP against a unified block list covering IPv6 edge cases; it gates both SSH outbound targets (`durable-object.ts`) and AI `base_url` (`agent/ssrf.ts`). When adding address families or reserved ranges, keep the DoH block list and the string-level checks synchronized.
 
@@ -326,6 +341,14 @@ release: 发布 vX.Y.Z <主题>版本（如 `release: 发布 v1.10.2 工作流�
 29. **CI paths-ignore 作用域** - `deploy.yml` 的 `paths-ignore` 使用标准 glob：`*` 不匹配 `/`，因此 `*.md` 只覆盖仓库根目录的 Markdown，`tests/` 等子目录下的文档变更（如 `tests/README.md`）会照常触发部署流水线。忽略目录内文件必须用 `**/*.md` / `**/*.png` 等跨目录模式；修改 `deploy.yml` 本身会触发一次校验运行（属于预期行为，且能验证新过滤规则）。
 
 30. **Agent exec 输出有界性（弱网 OOM 防线）** - `AgentExecChannel` 对 exec 通道 stdout/stderr 执行有界捕获：合计 4MB 硬上限（`MAX_EXEC_CAPTURE_BYTES`，超限不再续 SSH window 并由会话层关闭通道击杀远端命令，如无界输出的 `docker logs`），保留头 128KB + 尾 256KB 环形视图并附加截断说明，`onData/onExtendedData` 的布尔返回值控制 window 续期，改动时勿恢复无界累积。守卫不只此一层：`docker_manage(logs)` 强制 `--tail 200` 且拒绝 `-f/--follow`；工具结果序列化进 LLM 前经 64K 字符中间截断；socket 写带 15s deadline（超时关底层 socket 解挂）；独立于写路径的被动 idle 看门狗（60s 无入站数据即关闭）与终端输入队列 4MB 上限共同保证弱网下会话必然收敛，勿移除任一防线。
+
+31. **pi-lens 项目策略口径** - `.pi-lens.json` 仅供本机 pi-lens（AI 代码审查插件）读取，不参与构建、部署与 CI 门禁（同 #27 的 Biome 定位），`pi-lens-ignore` 行内注释仅为工具豁免、无运行时行为。其中 `rules.disable` 是已**逐条评估后的误报静音**（以风格类规则为主；`ignore` 仅豁免测试夹具/README/生成文件等路径），而非无差别静音：**XSS 类规则（`no-inner-html`/`ts-xss-dom-sink`）刻意不做项目级禁用**——行内 `pi-lens-ignore` 只豁免逐处核实过的站点（agent-panel 的 Markdown 渲染经 DOMPurify 消毒，其余动态值均 escapeHtml 或来自可信 i18n 词条），未来新增的 innerHTML 站点仍会被规则捕获。新增 innerHTML 时请优先保证转义/消毒并核实后加行内豁免，切勿把这两条加入 `disable` 列表；安全类规则（如 `ast-grep:no-open-redirect`）同理保持克制——扩大禁用清单前先确认告警为误报，优先修复或局部豁免。pi-lens 版本/规则集随设备升级可能产生新告警，处理标准以“是否真实影响运行与门禁”为准。
+
+32. **SFTP 在线编辑** - 编辑器走独立 `sftp_edit_read` 消息（`SFTPHandler.editReadFile`）：仅限 ≤2MB 文本（`EDITOR_MAX_FILE_SIZE`，前后端常量须一致），worker 侧空字节嗅探（前 8KB，与 Git 一致）拒绝二进制后才发报文；前端 `editor-content.ts` 负责 UTF-8 严格解码（失败回退 GB18030 只读，浏览器无 GBK 编码器故不提供非 UTF-8 保存）、BOM 剥离/回写与 EOL 归一/还原；保存前以 mtime+size 快照比对做冲突检测（`statRemote`，stat 失败或基线 -1 必须弹确认，不得静默覆盖），保存复用 `enqueueUploadTask(overwriteFirst: true)` 上传覆盖通道（默认上传仍为非覆盖探测，`i18n.test.ts` 源码断言守护该语义）；编辑读取/保存与普通传输共享单一上传状态机且在分享会话中随 `allowSftp` 门控并纳入 `edit` 审计操作。双击文件智能“打开”（`openEditorForFile` 的 `fallbackToDownload`）：可编辑尝试编辑器，worker 明确判定不可编辑（`sftp_error` 结构化 `code`：`binary`/`too_large`，消息边界白名单化后进入 `shouldFallbackToDownload`）或内容无法解码时自动转下载，且回退下载必须走既有串行下载队列（`queueDownloadFile`）而非裸 `downloadFile`（防并发二进制流串帧）；编辑读取同时只允许一次在途（`editReadActive` 互斥）；超时/权限等错误不触发回退。CodeMirror 6 为单 bundle 内联构建的既有依赖，语法高亮配色全部映射主题变量（`classHighlighter` + style.css），勿替换为 Monaco 或引入 CDN 版本。移动端：≤520px 窄屏近全屏+安全区+加大触摸目标（对齐 auth-challenge-dialog 先例）；触屏/窄屏下编辑器字号提升至 16px 以规避 iOS 对 contenteditable 聚焦时的强制页面缩放，勿回调字号。自动换行默认触屏/窄屏开启、桌面关闭（`pointer: coarse` 或 ≤520px，检测口径与字号规则一致），编辑器页脚开关状态持久化于 localStorage（`cloudssh_editor_wrap`），勿改动默认检测口径。
+
+33. **标签页管理与右键上下文菜单** - 标签页支持双击内联重命名与右键上下文菜单操作（重命名、克隆会话、关闭其他标签页、关闭当前标签页）。重命名提交空字符串或空白字符时，必须重新调用 `renderTabBar()` 恢复原标签文本展示并销毁内联 `<input>`，避免输入框卡死在标签栏；右键菜单的全局 document click 监听器必须以 `capture: true` 模式挂载并在 `hideTabContextMenu()` 中统一步骤式注销，防止菜单项内部的 `stopPropagation` 阻断清理导致监听器在多轮右键操作后泄漏累积，避免失效闭包误关新菜单。已保存服务器克隆会话必须通过 `/api/servers/:id/connect` 申请独立连接令牌开新 Tab，禁止跨 Tab 复用未授权连接。
+
+34. **命令片段占位符与 SFTP 面包屑/新建文件** - 命令片段支持 `{{var}}` 动态参数占位符（由 `snippet-variables.ts` 纯函数解析），仅在检测到有效占位符时拦截执行流并弹出参数录入对话框，输入完成后安全替换并填入终端；无占位符片段保持直填/执行的原生路径。SFTP 面包屑（`parsePathBreadcrumbs`）点击空白处平滑切换为绝对路径文本输入；表头多维排序（`sortSFTPEntries`）采用稳定排序算法，目录严格置顶，大小与时间初次点击默认降序。新建空白文件必须经过既有上传队列原子写入 0 字节内容并执行重名冲突检测，成功后自动唤起 CodeMirror 在线编辑。
 
 ## Deployment Notes
 
@@ -415,6 +438,7 @@ CLI: `npx wrangler secret set <SECRET_NAME>`
    2. 创建 PR 合并 `test` 到 `main`：
       - 标题遵循 `release: 发布 vX.Y.Z <主题>版本` 格式（与提交信息主题一致）。
       - 正文必须说明本次版本的更新内容：包含提交列表、关联 Issue/PR、验证结果。
+      - **Issue 默认保持 open**：发布 PR 正文不得使用 `Closes #xxx` / `Fixes #xxx` 等自动关闭关键字，除非用户明确要求关闭；关联 Issue 仅以「关联 Issue：#xxx」形式列出，由用户后续手动关闭（用户可能仍有反馈需要跟进）。
    3. **PR 的审核与合并由用户手动完成**：AI 创建 PR 后应等待用户审核并合并，不得自行合并或使用管理员旁路合并。
    4. 用户合并 PR 到 `main` 后（生产环境自动部署），AI 执行以下命令同步本地分支：
 

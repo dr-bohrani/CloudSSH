@@ -2,6 +2,12 @@ import type { Env, SSHConnectionConfig } from '../types';
 
 const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
 const MAX_AUDIT_EVENTS = 5000;
+
+/** 审计保留期默认值（天）：创建分享时可按链接自定义（7–365）。 */
+const DEFAULT_AUDIT_RETENTION_DAYS = 90;
+const MS_PER_DAY = 86_400_000;
+
+const TERMINAL_SHARE_STATUSES: ReadonlySet<ShareStatus> = new Set(['closed', 'revoked', 'expired']);
 const CONNECT_TICKET_TTL_MS = 60_000;
 
 type ShareStatus = 'unused' | 'claimed' | 'active' | 'closed' | 'revoked' | 'expired';
@@ -24,6 +30,9 @@ interface ShareStateRow {
   ticket_hash: string | null;
   ticket_expires_at: number | null;
   audit_bytes: number;
+  device_pub_key: string | null;
+  audit_purge_due: number | null;
+  audit_retention_days: number | null;
 }
 
 interface ShareInitBody {
@@ -35,10 +44,22 @@ interface ShareInitBody {
   serverName: string;
   expiresAt: number;
   maxSessionSeconds: number;
+  /** 审计明细保留天数（7–365）；缺省时服务端取默认 90 天。 */
+  auditRetentionDays?: number;
 }
 
 function jsonError(error: string, status: number): Response {
   return Response.json({ error }, { status });
+}
+
+/** 审计详情始终由 appendAudit 以 JSON.stringify 写入；防御性解析避免脏数据抛错。 */
+function safeParseDetails(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 async function sha256Base64Url(value: string): Promise<string> {
@@ -99,16 +120,35 @@ export class SSHShareDO {
       );
       CREATE INDEX IF NOT EXISTS idx_share_audit_time ON audit_events(occurred_at, id);
     `);
+    // 迁移：认领设备公钥（SPKI base64url，用于断线重连的设备绑定验签）。
+    // 已有环境的表结构通过 ALTER TABLE 补列，列已存在时忽略。
+    try {
+      this.db.exec('ALTER TABLE share_state ADD COLUMN device_pub_key TEXT');
+    } catch {
+      /* column already exists */
+    }
+    // 迁移：审计保留期到期时间（终态后自动清理调度用）。
+    try {
+      this.db.exec('ALTER TABLE share_state ADD COLUMN audit_purge_due INTEGER');
+    } catch {
+      /* column already exists */
+    }
+    // 迁移：审计保留天数（创建时可自定义；NULL 表示使用默认 90 天）。
+    try {
+      this.db.exec('ALTER TABLE share_state ADD COLUMN audit_retention_days INTEGER');
+    } catch {
+      /* column already exists */
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
     try {
+      const url = new URL(request.url);
       if (url.pathname === '/internal/init' && request.method === 'POST') {
         return this.initialize(await request.json<ShareInitBody>());
       }
       if (url.pathname === '/internal/claim' && request.method === 'POST') {
-        return this.claim(await request.json<{ token?: string }>());
+        return this.claim(await request.json<{ token?: string; devicePubKey?: string }>());
       }
       if (url.pathname === '/internal/connect/consume' && request.method === 'POST') {
         return this.consumeConnection(
@@ -130,6 +170,9 @@ export class SSHShareDO {
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 500));
         return this.ownerView(ownerUserId, after, limit);
       }
+      if (url.pathname === '/internal/audit/purge' && request.method === 'POST') {
+        return this.purgeAudit(await request.json<{ ownerUserId?: number }>());
+      }
       return new Response('Not Found', { status: 404 });
     } catch (error) {
       console.error('SSHShareDO error:', error instanceof Error ? error.message : String(error));
@@ -141,8 +184,18 @@ export class SSHShareDO {
     const share = this.getShare();
     if (!share) return;
     const now = Date.now();
+    // 审计保留期：终态满 90 天自动清除明细并写入自动清理墓碑
+    if (
+      TERMINAL_SHARE_STATUSES.has(share.status) &&
+      share.audit_purge_due !== null &&
+      now >= share.audit_purge_due
+    ) {
+      await this.purgeAuditContent(share, 'share.audit_auto_purged');
+      this.db.exec('UPDATE share_state SET audit_purge_due = NULL');
+      return;
+    }
     if (share.status === 'unused' && now >= share.expires_at) {
-      this.updateStatus(share, 'expired', now);
+      await this.updateStatus(share, 'expired', now);
       await this.syncOwnerMetadata(share, 'expired', { closedAt: now });
       return;
     }
@@ -175,11 +228,24 @@ export class SSHShareDO {
     ) {
       return jsonError('Invalid maximum session duration', 400);
     }
+    // 审计保留天数：可选；未提供时存 NULL（运行时取默认 90 天）。
+    let auditRetentionDays: number | null = null;
+    if (body.auditRetentionDays !== undefined) {
+      if (
+        !Number.isInteger(body.auditRetentionDays) ||
+        body.auditRetentionDays < 7 ||
+        body.auditRetentionDays > 365
+      ) {
+        return jsonError('Invalid audit retention', 400);
+      }
+      auditRetentionDays = body.auditRetentionDays;
+    }
     this.db.exec(
       `INSERT INTO share_state (
         singleton, share_id, token_hash, owner_user_id, owner_github_id,
-        server_id, server_name, expires_at, max_session_seconds, status
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 'unused')`,
+        server_id, server_name, expires_at, max_session_seconds,
+        audit_retention_days, status
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unused')`,
       body.shareId,
       body.tokenHash,
       body.ownerUserId,
@@ -187,22 +253,28 @@ export class SSHShareDO {
       body.serverId,
       body.serverName,
       body.expiresAt,
-      body.maxSessionSeconds
+      body.maxSessionSeconds,
+      auditRetentionDays
     );
     await this.state.storage.setAlarm(body.expiresAt);
     return Response.json({ success: true });
   }
 
-  private async claim(body: { token?: string }): Promise<Response> {
+  private async claim(body: { token?: string; devicePubKey?: string }): Promise<Response> {
     const share = this.getShare();
     if (!share || typeof body.token !== 'string') return jsonError('Invalid share link', 404);
     if ((await sha256Base64Url(body.token)) !== share.token_hash)
       return jsonError('Invalid share link', 404);
+    // 设备绑定公钥（可选）：格式为 SPKI DER 的 base64url 编码，仅接受合理的长度范围。
+    const devicePubKey =
+      typeof body.devicePubKey === 'string' && /^[A-Za-z0-9_-]{80,600}$/.test(body.devicePubKey)
+        ? body.devicePubKey
+        : null;
     const now = Date.now();
     if (share.status !== 'unused')
       return jsonError('This share link has already been used or revoked', 409);
     if (now >= share.expires_at) {
-      this.updateStatus(share, 'expired', now);
+      await this.updateStatus(share, 'expired', now);
       await this.syncOwnerMetadata(share, 'expired', { closedAt: now });
       return jsonError('This share link has expired', 410);
     }
@@ -212,11 +284,12 @@ export class SSHShareDO {
     const sessionExpiresAt = now + share.max_session_seconds * 1000;
     this.db.exec(
       `UPDATE share_state SET status = 'claimed', claimed_at = ?, session_expires_at = ?,
-       ticket_hash = ?, ticket_expires_at = ? WHERE singleton = 1 AND status = 'unused'`,
+       ticket_hash = ?, ticket_expires_at = ?, device_pub_key = ? WHERE singleton = 1 AND status = 'unused'`,
       now,
       sessionExpiresAt,
       ticketHash,
-      now + CONNECT_TICKET_TTL_MS
+      now + CONNECT_TICKET_TTL_MS,
+      devicePubKey
     );
     const updated = this.getShare();
     if (!updated || updated.status !== 'claimed' || updated.ticket_hash !== ticketHash) {
@@ -279,7 +352,7 @@ export class SSHShareDO {
     if (!configResponse.ok) {
       const error = await configResponse.text();
       await this.appendAudit('session.connection_failed', { status: configResponse.status }, now);
-      this.updateStatus(active, 'closed', now);
+      await this.updateStatus(active, 'closed', now);
       await this.syncOwnerMetadata(active, 'closed', { closedAt: now });
       return new Response(error, {
         status: configResponse.status,
@@ -293,7 +366,11 @@ export class SSHShareDO {
     await this.appendAudit('session.connecting', {}, now);
     await this.syncOwnerMetadata(active, 'active', { activeAt: now });
     await this.scheduleNextAlarm(active);
-    return Response.json({ config, serverName: active.server_name });
+    return Response.json({
+      config,
+      serverName: active.server_name,
+      devicePubKey: active.device_pub_key ?? null,
+    });
   }
 
   private async appendAuditEvent(body: Record<string, unknown>): Promise<Response> {
@@ -329,7 +406,7 @@ export class SSHShareDO {
     }
     const now = Date.now();
     await this.appendAudit('session.closed', { normal: body.normal === true }, now);
-    this.updateStatus(share, 'closed', now);
+    await this.updateStatus(share, 'closed', now);
     await this.syncOwnerMetadata(share, 'closed', { closedAt: now });
     return Response.json({ success: true });
   }
@@ -342,7 +419,7 @@ export class SSHShareDO {
     }
     const now = Date.now();
     await this.appendAudit(`share.${status}`, {}, now);
-    this.updateStatus(share, status, now);
+    await this.updateStatus(share, status, now);
     if (share.session_name) {
       const sessionStub = this.env.SSH_SESSION.get(
         this.env.SSH_SESSION.idFromName(share.session_name)
@@ -361,23 +438,95 @@ export class SSHShareDO {
     return Response.json({ success: true });
   }
 
+  /** 分享者清空终态会话的全部审计明细，写入墓碑事件保留追责线索。 */
+  private async purgeAudit(body: { ownerUserId?: number }): Promise<Response> {
+    const share = this.getShare();
+    if (!share) return jsonError('Share not found', 404);
+    if (!Number.isInteger(body.ownerUserId) || body.ownerUserId !== share.owner_user_id) {
+      return jsonError('Forbidden', 403);
+    }
+    if (!TERMINAL_SHARE_STATUSES.has(share.status)) {
+      return jsonError('Share session is not finished', 409);
+    }
+    await this.purgeAuditContent(share, 'share.audit_purged');
+    this.db.exec('UPDATE share_state SET audit_purge_due = NULL');
+    // 手动清空即代表不再需要自动清理：取消已排期的唤醒，避免 90 天后一次无效唤起
+    try {
+      await this.state.storage.deleteAlarm();
+    } catch {
+      /* 当前无闹钟时忽略 */
+    }
+    return Response.json({ success: true });
+  }
+
+  /** 清空审计明细并写入墓碑；重置 audit_bytes。手动清空与到期自动清理共用。 */
+  private async purgeAuditContent(share: ShareStateRow, eventType: string): Promise<void> {
+    const occurredAt = Date.now();
+    this.db.exec('DELETE FROM audit_events');
+    this.db.exec('UPDATE share_state SET audit_bytes = 0');
+    await this.appendAudit(eventType, {}, occurredAt);
+    await this.notifyOwnerAuditPurged(
+      share,
+      eventType === 'share.audit_auto_purged' ? 'auto' : 'manual',
+      occurredAt
+    );
+  }
+
+  /** 尽力同步清理留痕到所有者 UserDBDO（管理端集中展示）；失败不影响已完成的清理。 */
+  private async notifyOwnerAuditPurged(
+    share: ShareStateRow,
+    purgeType: 'manual' | 'auto',
+    occurredAt: number
+  ): Promise<void> {
+    try {
+      const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName(share.owner_github_id));
+      const response = await stub.fetch(
+        new Request(`http://internal/internal/shares/${share.share_id}/audit-purged`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: share.owner_user_id,
+            purged_at: occurredAt,
+            purge_type: purgeType,
+          }),
+        })
+      );
+      if (!response.ok) {
+        console.error('SSHShareDO: failed to sync audit purge trace:', response.status);
+      }
+    } catch (error) {
+      console.error('SSHShareDO: failed to sync audit purge trace:', error);
+    }
+  }
+
   private ownerView(ownerUserId: number, after: number, limit: number): Response {
     const share = this.getShare();
     if (!share || share.owner_user_id !== ownerUserId) return jsonError('Forbidden', 403);
+    // 清理墓碑事件（purgeAuditContent 写入的两种 event_type）不进入常规列表，
+    // 单独作为 removals 返回供前端折叠面板展示；SQL 字面量为编译期常量。
     const events = this.db
       .exec(
         `SELECT id, occurred_at, event_type, details FROM audit_events
-       WHERE id > ? ORDER BY id ASC LIMIT ?`,
+       WHERE id > ?
+         AND event_type NOT IN ('share.audit_purged', 'share.audit_auto_purged')
+       ORDER BY id ASC LIMIT ?`,
         after,
         limit + 1
       )
       .toArray() as Array<{ id: number; occurred_at: number; event_type: string; details: string }>;
+    const removalRows = this.db
+      .exec(
+        `SELECT occurred_at, event_type FROM audit_events
+       WHERE event_type IN ('share.audit_purged', 'share.audit_auto_purged')
+       ORDER BY occurred_at DESC`
+      )
+      .toArray() as Array<{ occurred_at: number; event_type: string }>;
     const hasMore = events.length > limit;
     const visible = events.slice(0, limit).map((event) => ({
       id: event.id,
       occurredAt: event.occurred_at,
       eventType: event.event_type,
-      details: JSON.parse(event.details),
+      details: safeParseDetails(event.details),
     }));
     return Response.json({
       share: {
@@ -392,6 +541,10 @@ export class SSHShareDO {
         auditBytes: share.audit_bytes,
       },
       events: visible,
+      removals: removalRows.map((row) => ({
+        occurredAt: row.occurred_at,
+        eventType: row.event_type,
+      })),
       hasMore,
       nextAfter: visible.at(-1)?.id ?? after,
     });
@@ -402,7 +555,11 @@ export class SSHShareDO {
     return rows.length ? (rows[0] as ShareStateRow) : null;
   }
 
-  private updateStatus(share: ShareStateRow, status: ShareStatus, closedAt: number): void {
+  private async updateStatus(
+    share: ShareStateRow,
+    status: ShareStatus,
+    closedAt: number
+  ): Promise<void> {
     this.db.exec(
       `UPDATE share_state SET status = ?, closed_at = ?, ticket_hash = NULL,
        ticket_expires_at = NULL WHERE singleton = 1`,
@@ -411,6 +568,24 @@ export class SSHShareDO {
     );
     share.status = status;
     share.closed_at = closedAt;
+    // 终态进入审计保留期：到期自动清理调度；无审计明细则跳过
+    if (TERMINAL_SHARE_STATUSES.has(status)) {
+      const count = Number(this.db.exec('SELECT COUNT(*) AS count FROM audit_events').one().count);
+      if (count > 0) {
+        const retentionDays = share.audit_retention_days ?? DEFAULT_AUDIT_RETENTION_DAYS;
+        const due = Date.now() + retentionDays * MS_PER_DAY;
+        this.db.exec('UPDATE share_state SET audit_purge_due = ?', due);
+        try {
+          await this.state.storage.setAlarm(due);
+          share.audit_purge_due = due;
+        } catch (error) {
+          // 排期失败必须回滚：否则库里留下“有排期但无闹钟”的幽灵状态，自动清理将永不触发
+          console.error('SSHShareDO: failed to schedule audit purge alarm:', error);
+          this.db.exec('UPDATE share_state SET audit_purge_due = NULL');
+          share.audit_purge_due = null;
+        }
+      }
+    }
   }
 
   private async appendAudit(

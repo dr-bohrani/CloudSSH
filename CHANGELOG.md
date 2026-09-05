@@ -5,6 +5,218 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-09-05
+
+### Added
+
+- **命令片段库抽屉式面板重构（对齐 SFTP 规范）**：
+  - 彻底摒弃原有的小弹窗（Dialog）设计，对齐 SFTP 与 Agent 规范，重构为右侧滑出抽屉（Slide-over Drawer Panel），宽度自适应 `min(clamp(440px, 45vw, 680px), 100vw)`，移动端自适应全屏。
+  - 抽屉展开时左侧终端保持可见，用户可在同一屏幕内完成片段浏览、填入终端或执行验证。
+  - 表单重构为内联折叠模式（Collapsible Form），默认收起，点击“+ 新建”或“编辑”平滑展开，大幅释放可视空间，单屏可展示 10+ 条片段卡片。
+- **命令片段分类管理体系（Category）**：
+  - 顶部增加横向分类筛选胶囊栏（Category Chips）：`[全部 (N)] [分类A (x)] ... [未分类 (z)]`，动态去重聚合各分类片段数量。
+  - 表单内新增分类输入项，搭配 `<datalist>` 分类建议自动联想，支持直接录入新分类或快速复用已有分类。
+  - 联动检索：分类筛选胶囊与搜索框关键词（支持匹配名称、命令、分类）执行交集过滤，支持精准检索。
+- **后端架构与存储层无缝迁移**：
+  - `src/snippet-schema.ts`：扩展 `SNIPPET_CATEGORY_MAX_LENGTH = 30` 与分类字段规范化校验。
+  - `src/worker/user-db.ts`：SQLite `command_snippets` 表动态追加 `category TEXT NOT NULL DEFAULT ''` 列，启动时通过 `PRAGMA table_info` 自动幂等迁移，旧数据自动归入“未分类”，零停机零风险。
+  - `frontend/src/snippet-store.ts`：云端（`RemoteSnippetStore`）与本地（`LocalSnippetStore`）存储层同步扩展 `category` 字段。
+- **UI 交互与终端原生质感优化**：
+  - 优化 Header“云端同步 / 本地存储”为状态圆点指示器，卡片分类重构为 `#tag` 格式、动态参数重构为 `{ }` 元数据格式，彻底消除与操作按钮的视觉混淆。
+  - 修复搜索输入框内放大镜图标因简写 padding 导致的字形裁剪与重叠问题，规范居中布局与一键清空按钮。
+  - 移除前端文案中的 emoji（将 `💡` 替换为终端原生风格的 `[!]` 符号）。
+
+## [2.0.0] - 2026-09-04
+
+### Added
+
+- **代号 Gem-Alpha 版本发布**：围绕核心交互优化、SFTP 深度体验、命令片段库增强、多标签页上下文操作、AI Agent 体验升级及架构单体解耦瘦身展开的重大版本里程碑。
+- **架构深度解耦瘦身**：
+  - 抽离 `ShareAuditWriter`（`src/worker/share-audit-writer.ts`），解耦分享审计记录持久化管道，封装防抖刷新与互斥写锁。
+  - 抽离 `KeyboardInteractiveAuthHandler`（`src/worker/ssh-interactive-auth.ts`），解耦 RFC 4256 交互式键盘认证状态机，独立管理多轮挑战 ID、超时看门狗及组包响应。
+  - 抽离 `DetachedSessionBuffer`（`src/worker/ssh-detached-buffer.ts`），解耦弱网断线保持 128KB 有界环形缓冲队列与重连补偿逻辑。
+  - 抽离 `detectAndPersistRemoteOS`（`src/worker/os-detect.ts`），解耦远端操作系统探测执行器，独立管理命令探测与 UserDB 持久化。
+  - 解耦 SFTP 在线编辑与交互体系：抽离 `SFTPEditorCoordinator`（`frontend/src/sftp-editor-session.ts`，编辑挂载与冲突比对）、`sftp-dialogs.ts`（文件/目录创建/重命名弹窗与合法性校验）、`sftp-helpers.ts`（面包屑与三向排序辅助）与 `sftp-transfer.ts`（传输状态模型）。
+- **SFTP 路径面包屑与多维排列表头**：引入可点击导航的面包屑路径组件，保留输入框快速跳转与失焦自动恢复；表头支持按名称、大小、修改时间三向排序，目录智能置顶。
+- **SFTP 工具栏新建文件**：点击工具栏「新建文件」按钮呼出命名弹窗，通过 0 字节探测上传后无缝调起在线编辑器。
+- **命令片段模糊搜索与一键复制**：片段库新增实时搜索过滤，支持名称与命令模糊匹配；列表项增加一键复制到剪贴板按钮。
+- **命令片段动态参数占位符**：支持 `{{variable}}` 语法，插入或执行前自动提取变量并弹出输入弹窗，支持默认值与输入记忆。
+- **服务器一键克隆**：服务器卡片增加复制操作，快速复用主机、端口、用户名、跳板机关系与标签，自动附加 `(Copy)` 后缀并安全剔除敏感凭据。
+- **多标签页双击重命名与上下文菜单**：双击标签页标题直接进行内联编辑（`Enter` 保存，`Esc` 取消，空值自动恢复原名）；右键标签弹出操作菜单（重命名、克隆会话、关闭其他、关闭当前）。
+- **终端快捷键增强**：macOS 新增 `Cmd+F` 调出搜索栏，`Cmd+K` / `Ctrl+Shift+K` 清除终端屏幕缓冲区（`terminal.clear()`），并完好保留 Linux/Bash 默认的 `Ctrl+K` 剪切行尾逻辑。
+- **AI Agent 助手体验全面升级**：
+  - **动态 Clamp 响应式窗口**：参考 SFTP 采用 `min(clamp(420px, 40vw, 600px), 100%)` 弹性宽度策略，顶栏对齐 `h-12` 规范并内联 `smart_toy` 助手图标。
+  - **桌面端上下垂直范围严格限制于终端窗口内**：分栏高度严格限制在 `#terminal-area` 内部，绝不遮挡顶部状态栏右上方的双端延迟展示（`#term-info`）与连接状态。
+  - **移动端全屏覆盖与软键盘联动**：移动端保持全屏覆盖（`position: fixed; top: 48px;`）保证小屏下充裕的对话阅读空间；打开 Agent 时联动隐藏底部软键盘终端快捷工具栏，彻底解决输入框和发送按钮被遮挡问题；退出返回终端后自动恢复工具栏。
+  - **诊断 Prompt 预设与触控热区强化**：提供 4 组一键场景诊断 Prompt 胶囊（分析报错、系统负载、端口网络、Docker 状态），移动端全面优化 Prompt 胶囊（`32px`）、发送按钮（`40px`）、代码块操作（`30px`）和高危命令确认弹窗按钮触控热区；支持按 `Esc` 快速退出 Agent 返回终端。
+
+### Fixed
+
+- **多标签页空值重命名卡死**：修复标签页重命名提交空字符串或纯空白时卡死输入框状态的问题，空值自动恢复原标签名。
+- **右键上下文菜单监听器泄漏**：修复连续右键或外部点击关闭右键菜单时，全局事件监听器残留的隐患。
+- **移动端 AI Agent 底部输入框被工具栏遮挡**：修复移动端打开 Agent 时底部软键盘终端快捷键工具栏覆盖输入框与发送按钮的层级冲突。
+
+### Changed
+
+- **代码健康规范治理**：全局显式声明 `parseInt` 10 进制基数，消解无用构造函数、多处冗余导入、收敛严格类型断言与类型系统静态警告。
+
+## [1.14.4] - 2026-09-02
+
+### Fixed
+
+- **SFTP 在线编辑错误横幅绕过消息边界校验**：`handleSFTPError` 的 edit 分支在无待决请求时此前用原始 `msg.message` 直接展示面板错误横幅，绕过边界校验；统一改用校验后的 `message` 变量，与 `rejectEditRead` 同源。保留 hadPending 以 waiter 为准的判定并补充注释：超时回调置空 waiter 后 finally 在同一微任务级联中复位 `editReadActive`，迟到错误帧不可能于读取在途时被处理，横幅兜底不构成双重报错。
+
+## [1.14.3] - 2026-09-02
+
+### Changed
+
+- **SFTP 双击智能“打开”**：文件管理器双击文件不再一律下载——目录仍为导航，文本文件直接打开在线编辑器；文件明确不可在线编辑时（超过 2MB、空字节嗅探判定的二进制、内容无法解码）自动转为下载，不打断操作流。回退下载统一走既有串行下载队列，避免与在途下载并发占用二进制流；`sftp_error` 增加结构化 `code`（`binary`/`too_large`），消息边界白名单校验后才进入回退判定，超时/权限等瞬时错误保持提示、不触发静默下载；编辑读取增加互斥保护，防止并发请求覆盖分块归属。显式「编辑」按钮行为不变。
+- **回归测试**：新增双击智能打开单元测试（回退判定语义）与 4 条 e2e（文本→编辑器、二进制→转下载、超大→直接下载且不发起编辑读取、目录→导航），既有 SFTP 在线编辑相关 e2e 保持全量通过。
+
+## [1.14.2] - 2026-08-30
+
+### Fixed
+
+- **匿名连接页删除最近记录误触发建立连接**：最近连接列表的删除按钮未声明 `type`，位于 `connection-form` 内默认按 `type="submit"` 处理，点击「x」在删除记录的同时会误提交表单并触发 `handleConnect()` 建立新连接；`stopPropagation` 无法阻止按钮的默认表单提交动作，删除按钮显式补上 `type="button"` 根治误触连接。
+- **连接成功后清空敏感凭据字段**：连接成功后清空密码/私钥输入框，避免关闭 SSH 会话返回匿名连接页时密码仍残留于输入框（此前密码残留会放大删除按钮误触连接问题——密码非空时点「x」直接建立连接，清空后才只能看到删除效果）。
+- **回归测试**：新增源码级断言，守护删除按钮必须显式 `type="button"`、敏感字段清空语句必须位于 `terminal.connect` 之后，防止该问题回归。
+
+## [1.14.1] - 2026-08-30
+
+### Added
+
+- **SFTP 编辑器自动换行**（#113）：编辑器页脚新增「自动换行」开关，基于 CodeMirror 6 `EditorView.lineWrapping` 经 `Compartment` 动态切换（不重建编辑器、不丢状态，切换后焦点回到编辑区）；触屏/窄屏（`pointer: coarse` 或 ≤520px）默认开启、桌面端默认关闭由用户手动开启，检测口径与编辑器 16px 字号媒体查询一致；偏好持久化于 `localStorage`（`cloudssh_editor_wrap`），隐私模式等存储不可用时静默回退设备默认值；移动端页脚三按钮空间优化（min-width 96→84px，320px 窄屏不溢出）；i18n 双语词条；新增桌面/移动双视口 e2e 守护默认值、切换与持久化。
+
+## [1.14.0] - 2026-08-29
+
+### Added
+
+- **SFTP 在线编辑文件**（#111）：在 SFTP 文件管理器中直接编辑远端文本文件。后端新增 `sftp_edit_read` 消息：仅限 ≤2MB 文本（前后端常量一致），空字节嗅探（前 8KB，与 Git 同策略）拒绝二进制后才下发，`sftp_edit_start`（mtime/size 元数据）→ 128KB 二进制分帧 → `sftp_edit_done` 流式复用既有传输管道；前端基于 CodeMirror 6（单 bundle 内联构建）提供模态编辑器，支持 shell/YAML/JSON/Python/Markdown/HTML/CSS/Dockerfile/systemd 等语法高亮，配色全部映射主题变量跟随亮/暗/自定义主题；保存前以 mtime+size 快照比对做冲突检测，远端已被修改时要求显式确认覆盖，保存复用既有上传覆盖通道并在成功后刷新冲突基线；保留原文件换行符（LF/CRLF）与 BOM（字节级往返测试）；UTF-8 严格解码可编辑，GBK/GB18030 自动识别并以只读模式打开；关闭前未保存修改二次确认；编辑读取/保存随分享会话 `allowSftp` 门控并纳入 `edit` 审计操作。
+- **编辑器移动端适配**：≤520px 窄屏下编辑器近全屏（含左右安全区），软键盘弹出时跟随可视视口收缩；关闭按钮 44px 触摸目标、保存按钮加大；触屏/窄屏下 CodeMirror 编辑区与搜索面板输入框字号提升至 16px，规避 iOS 对 contenteditable 聚焦时的强制页面缩放；新增 390×844 窄视口 e2e。
+- **SFTP 面板桌面宽度有界弹性**：固定 420px 改为 `clamp(420px, 40vw, 600px)`，1280 主流笔记本下面板 512px、文件名列 +92px，1500px 起 600px 封顶保持终端可见；移动/平板全屏行为不变。
+
+### Fixed
+
+- **SFTP 操作栏按钮文字竖排**：新增编辑按钮后 6 个按钮总宽超出固定面板宽度，WebKit 对嵌套 flex 的内在尺寸计算把 CJK 标签压成单字竖排（Chromium 则表现为压缩换行）；防换行规则提升为全局无条件生效（标签 `white-space: nowrap` + 按钮 `flex: 0 0 auto` + 空间不足时整栏横向滚动），移动端媒体查询仅保留 40px 触摸目标；新增双视口 e2e 并纳入 webkit-mobile（iPhone 13）项目守护。
+
+### Changed
+
+- wrangler 升级至 4.125.0：修复 CI 部署时报 "Unable to fetch bindings, routes, or services metadata from the dashboard"（Cloudflare API 侧错误）；4.127.1 因发布不足 7 天被 `minimumReleaseAge` 供应链策略拦截，版本成熟后再跟进。
+
+## [1.13.1] - 2026-08-28
+
+### Added
+
+- 支持直接粘贴 PKCS#1/PKCS#8/SEC1 封装的 PEM 私钥（RSA/EC/Ed25519）：新增最小 DER/ASN.1 读取器（`src/ssh/der.ts`）与 PKCS 解析器（`src/ssh/pkcs.ts`），`auth.ts` 按 PEM 封装统一分发，RSA/EC/Ed25519 各路径复用共享构建器产出一致公钥 blob；兼容 macOS `ssh-keygen -m PEM` 的 SpecifiedECDomain 显式曲线参数与 Ed25519 PKCS#8 嵌套 OCTET STRING 结构（RFC 8410）；公钥/X.509 证书/PuTTY PPK/口令加密 PEM 误贴给出指向性提示，新增 5 个同密钥多编码夹具与 16 个回归测试（跨编码 blob 一致性、端到端验签、误贴提示矩阵）。
+
+### Fixed
+
+- 修复 v1.11.0 起跳板机连接必现失败的问题：会话秒级恢复重构误删了跳板循环中的 `await hopSession.waitUntilAuthenticated()`，导致 `openDirectTcpip` 在跳板会话认证完成（`tunnel-ready`）前被调用，所有跳板连接必现 "SSH jump host is not ready for TCP forwarding"（#108，修复 PR #109 作者 @xuthuslei）；补充跳板会话就绪时序回归测试，锁定 SSHSession 与 DO 跳板循环之间的时序契约，防止同类回归漏过 CI；更新贡献者名单。
+
+## [1.13.0] - 2026-08-27
+
+### Added
+
+- **Theme V3 背景层**：新增 `background` 顶层模块（schemaVersion 3），支持 solid / linear / radial / mesh 四类背景，最多 5 个停靠点（均过白名单颜色校验）、线性角度（0–360）、读性遮罩（scrim，渐变背景强制暗色 ≥0.25 / 浅色 ≥0.35 的下限）与缓慢漂移（drift）动画；背景由 `body::before` 固定全屏层承载，纯 CSS 变量驱动、零 DOM 改动。
+- **Theme V3 效果注册表**：新增 `effects` 模块（scanline / flicker / glow / noise），强度钳制在 0–1；扫描线与闪烁门控从「cyberpunk 风格硬编码」泛化为 `data-fx-*` 属性驱动（Cyberpunk 内置主题迁移为参数化配置，默认视觉不变）；噪点使用内联 feTurbulence SVG 纹理，无外部请求。
+- **Theme V3 版式与表面**：新增 `typography` 模块（字号缩放 0.85–1.25、圆角缩放 0.5–2，均叠加在密度/形状档位之上）与独立的 `appearance.blur` 表面模糊档位（none / subtle / strong）；动效门控（`data-ui-motion`）与 `prefers-reduced-motion` 双重视角约束背景漂移与闪烁。
+- **两套旗舰内置主题**：内置主题从 5 款扩至 7 款，新增 **CRT Amber**（琥珀磷光深色主题：径向暗角背景 + 扫描线/闪烁/辉光/噪点全开 + 方形 mono 造型）与 **Glass**（蓝紫浅色玻璃态主题：mesh 粉彩漂移背景 + 强表面模糊 + 1.4× 圆角 + 分段控件）；两者明暗对比、质感与动效差异显著。
+- **Apple 浅色主题**：内置主题 Glacier 替换为 Apple（macOS 风格浅色），占用 soft 风格预设占位并保持四种 UI 风格全覆盖；终端 ANSI 16 色采用 Apple 系统色无障碍变体，UI 变量取材 Apple 设计语言（#f5f5f7 背景、#0066da 链接蓝、#5856d6 systemIndigo Agent 色），文本/强调/错误色全部通过 4.5:1 对比度并纳入测试断言。
+- **在线主题编辑器支持 V3**：新增背景层（类型/角度/遮罩/动画/停靠点）、效果（四项强度滑杆）与版式缩放（字号/圆角）三组面板及 blur 档位；导出升级为 schemaVersion 3 并携带新模块，导入按与后端同源的钳制/白名单规则消毒；同步脚本提取 `BUILT_IN_BACKGROUND` / `BUILT_IN_EFFECTS` / `BUILT_IN_TYPOGRAPHY` 注入预设。
+
+### Changed
+
+- `THEME_SCHEMA_VERSION` 升至 3；V2 主题数据自动升级（新模块缺省即旧行为），存量 `baseTheme: 'glacier'` 主题导入时优雅降级（字段丢弃、按明暗模式回退基底），旧版 glacier 选择在 localStorage 中一次性迁移到 Standard Dark。
+- 表面模糊由 shadow 预设派生值改为独立 blur 档位完全接管（后置规则同优先级胜出），geometry 变量（圆角/字号）改为 calc 乘法组合缩放。
+
+### Fixed
+
+- 补充既有 lint 清洁（forEach 回调返回值、未使用导入）。
+
+## [1.12.2] - 2026-08-27
+
+### Changed
+
+- 分享审计详情由列表底部区块改为面板内独立视图：点击「查看审计」立即切换至占满面板的详情视图并展示加载占位，消除长列表下审计在底部展开需手动滚动才能看到而导致的“点击无响应”错觉（详情视图自带返回按钮，返回后恢复列表滚动位置；重新打开弹窗重置为列表视图）。
+- 审计内容独占面板高度：结构化事件列表与终端记录展示高度分别提升至 `max-h-64` / `max-h-[50vh]`；查看审计按钮点击后进入禁用加载态，防止重复点击。
+
+### Added
+
+- 新增 `common.back` 中英词条（返回 / Back）。
+
+## [1.12.1] - 2026-08-26
+
+### Added
+
+- 新增 `share.auditCleanupStatus` 中英词条（`{status}（审计 {time}）` / `{status} (audit {time})`）。
+
+### Changed
+
+- 审计清理记录折叠区每行扩展展示审计生成时间：「清理时间 + 状态（审计时间）· 方式」；审计时间取首次审计事件时间（`claimed_at`，认领时写入 `share.claimed`），`created_at` 兜底。
+
+## [1.12.0] - 2026-08-26
+
+### Added
+
+- 分享审计记录保留与清理能力：分享者在终态后可整体清空全部审计明细（写入墓碑事件保留追责线索，`audit_bytes` 同步重置）或导出完整 JSON 归档（含生命周期与终端输出原文）。
+- 审计保留期可自定义（7–365 天，默认 90 天）：创建分享时指定；终态进入保留期，到期由 alarm 自动清除明细并写入自动清理墓碑。
+- 审计清理留痕集中展示：清理时间与方式（手动/自动）同步至用户库（`audit_purged_at`/`audit_purge_type`）并以折叠面板展示；已清理的分享等同删除效果，不再提供查看审计入口。
+- 新增审计清理回归测试（8 用例）：墓碑隔离、归属/终态校验、同步失败容错、排期回滚、留痕接缝与迁移幂等。
+
+### Changed
+
+- 审计保留期服务端校验统一为 7–365 天（ShareDO 与 Worker 创建入口白名单一致）。
+- 手动清空审计后同步取消已排期的自动清理闹钟，避免到期后的无效唤起。
+- 清理墓碑事件（`share.audit_purged`/`share.audit_auto_purged`）从常规审计事件流分离：`ownerView` 单独以 `removals` 返回，前端不再把清洗记录当作普通事件渲染。
+- UserDBDO SQL 查询改为类型化封装（`query<T>`/`one<T>`），消除 22 处 `as unknown as` 断言及对应说明注释；COUNT 查询统一走 `one<T>`。
+- 分享会话名随机数改由 `crypto.randomUUID()` 生成；OAuth 回调与 base URL 解析增加防御性兜底。
+- 测试类型检查纳入门禁：`tests/` 拆分 `tsconfig.worker` / `tsconfig.frontend` 两个项目（workers-types 与 DOM lib 的 `Element` 接口冲突，无法在单一配置共存），并修复暴露的 3 处测试代码类型缺陷。
+- 供应链与权限收紧：pnpm 启用 `blockExoticSubdeps`/`minimumReleaseAge`（7 天）/`no-downgrade`；CI 部署权限收敛为 `contents: read`；新增 `.gitleaks.toml` 误报豁免配置。
+
+### Fixed
+
+- 审计保留期闹钟设置失败静默：失败时回滚排期状态并同步内存，杜绝“有排期但无闹钟”的幽灵状态（自动清理永不触发）。
+- `updateStatus` 调用点统一 `await`，消除异步化改造后的未处理 rejection 风险。
+- 部署窗口期 UserDBDO 不支持审计留痕路由时清理仍可完成（尽力同步，失败仅记录日志）。
+- pi-lens 行内抑制失效：误报豁免注释与目标行之间被说明注释隔断，已补为紧邻放置。
+
+### Docs
+
+- AGENTS.md 第 25 条同步清理触发条件、墓碑/removals 域与留痕同步失败边界；新增第 31 条 pi-lens 项目策略口径（XSS 类规则刻意不做项目级禁用，仅行内逐处豁免）。
+- AGENTS.md 开发命令补充供应链策略约束说明；`tests/README.md` 说明测试类型检查拆分原因。
+
+## [1.11.0] - 2026-08-25
+
+### Added
+
+- Durable Object 会话保持：异常断线进入 60 秒保持期，断线期间终端输出有界缓冲（128KB）+ 背压暂停，恢复后一次性补发并续借 Window 额度；主动退出立即销毁。
+- 分享会话秒级恢复与设备绑定：认领时绑定非可导出 ECDSA P-256 设备公钥，断线重连需对规范挑战串完成签名验签（nonce 验签前单次消费防重放）。
+- 恢复凭据轮换：每次成功恢复轮换 resume token，旧 token 降级为“上一代”容忍一次，覆盖弱网下轮换帧丢失导致的永久锁死。
+- 到期前 1 分钟双语预警事件，挂机用户可提前感知分享会话即将结束；服务端终结信号识别后立即进入终态，不再空转重试。
+- 恢复链路 DEBUG 诊断面包屑（`[resume-debug]`：保持/销毁决策与各拒绝分支原因）。
+- 新增分享会话恢复安全测试矩阵（设备验签、nonce 重放、撤销/过期、token 代际、未绑定拒绝等 9 用例）。
+
+### Changed
+
+- 分享会话恢复统一要求设备绑定（严格口径）：未绑定设备身份的会话不发放恢复凭据，服务端一律拒绝（`not_bound` 审计），杜绝无设备约束的凭据恢复；断线即提示原因并即时终结。
+- 分享恢复重试改为指数退避铺满整个断线保持窗口（58s），末次尝试明确提示；移除此前的线性短间隔重试。
+- 恢复后重发双段延迟基线（rtt 帧），修复秒级恢复后状态栏 CF 段缺失；客户端↔CF 段由心跳首拍即时补齐。
+- 认领时设备绑定失败的落地页提示移除（方案 B）：无痕模式等瞬态存储在认领时不可检测，绑定失败改为断线时终端提示。
+- 落地页与管理端渲染模板改用 DOM API 构建，消除 innerHTML 拼接站点。
+
+### Fixed
+
+- 撤销/过期覆盖断线保持期（detached）会话：修复撤销后宽限期内仍可凭旧凭据恢复的盲区。
+- 无缝恢复后 SFTP attach URL 断链：恢复响应回传 attach URL，SFTP 数据通道可重建。
+- resume 升级路径补齐 `REQUIRE_GITHUB_AUTH` 门禁，与 direct / one-time-token 路径对齐。
+- 跳板连接状态消息 `index/total` 参数回归。
+- 分享错误映射层泄漏词条键名导致 E2E 失败；分享恢复测试时间戳二次取值导致的验签偶发失败。
+- 补全分享链路中英文本地化缺口：审计事件标签（`session.detached/resumed` 等）、服务端英文错误映射、英文界面向中文反向显示。
+
+### Docs
+
+- AGENTS.md 第 25 条同步设备绑定、上一代 token 容忍、严格恢复口径与断线保持语义。
+
 ## [1.10.5] - 2026-08-22
 
 ### Removed

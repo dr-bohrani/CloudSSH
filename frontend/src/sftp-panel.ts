@@ -1,6 +1,29 @@
+import {
+  type ActiveEditorSession,
+  type EditReadErrorCode,
+  SFTPEditorCoordinator,
+  shouldFallbackToDownload,
+} from './sftp-editor-session';
 import { onLocaleChange, t, translateDocument } from './i18n';
+import {
+  escapeHtml,
+  formatSize,
+  formatTimestamp,
+  getFileIcon,
+  parsePathBreadcrumbs,
+  sortSFTPEntries,
+  type SFTPSortField,
+  type SFTPSortOptions,
+} from './sftp-helpers';
 import { updateSelection } from './sftp-selection';
-import { confirmAction, requestText } from './ui-feedback';
+import { Deferred, UploadWaiter } from './sftp-transfer';
+import {
+  confirmDeleteItems,
+  promptMkdirName,
+  promptNewFileName,
+  promptRename,
+} from './sftp-dialogs';
+import { confirmAction, notify } from './ui-feedback';
 
 export interface SFTPFileEntry {
   name: string;
@@ -21,115 +44,14 @@ const UPLOAD_CONCURRENCY = 8;
 const DOWNLOAD_URL_REVOKE_DELAY_MS = 1000;
 const SFTP_HEARTBEAT_INTERVAL_MS = 30000;
 
-function validateRemoteName(value: string): string | null {
-  if (value === '.' || value === '..') return t('sftp.invalidName');
-  if (value.includes('/') || value.includes('\0')) return t('sftp.invalidName');
-  return null;
-}
-
-class Deferred<T> {
-  promise: Promise<T>;
-  resolve!: (value: T | PromiseLike<T>) => void;
-  reject!: (reason?: unknown) => void;
-
-  constructor() {
-    this.promise = new Promise<T>((resolve, reject) => {
-      this.resolve = resolve;
-      this.reject = reject;
-    });
-  }
-}
-
-interface UploadConflict {
-  path: string;
-  existingSize: number;
-}
-
-type UploadStartResult = { status: 'ready' } | { status: 'conflict'; conflict: UploadConflict };
-
-class UploadWaiter {
-  private ready: Deferred<UploadStartResult> | null = null;
-  private progress: Deferred<number> | null = null;
-  private complete: Deferred<void> | null = null;
-  private progressQueue: number[] = [];
-  private progressQueueHead = 0;
-
-  waitReady(): Promise<UploadStartResult> {
-    this.ready = new Deferred<UploadStartResult>();
-    return this.ready.promise;
-  }
-
-  resolveReady(): void {
-    this.ready?.resolve({ status: 'ready' });
-    this.ready = null;
-  }
-
-  resolveConflict(conflict: UploadConflict): void {
-    this.ready?.resolve({ status: 'conflict', conflict });
-    this.ready = null;
-  }
-
-  waitProgress(): Promise<number> {
-    const queued = this.progressQueue[this.progressQueueHead];
-    if (queued !== undefined) {
-      this.progressQueueHead++;
-      this.compactProgressQueue();
-      return Promise.resolve(queued);
-    }
-
-    this.progress = new Deferred<number>();
-    return this.progress.promise;
-  }
-
-  resolveProgress(loaded: number): void {
-    if (this.progress) {
-      this.progress.resolve(loaded);
-      this.progress = null;
-      return;
-    }
-
-    this.progressQueue.push(loaded);
-  }
-
-  waitComplete(): Promise<void> {
-    this.complete = new Deferred<void>();
-    return this.complete.promise;
-  }
-
-  resolveComplete(): void {
-    this.complete?.resolve();
-    this.reset();
-  }
-
-  reject(message: string): void {
-    const error = new Error(message);
-    this.ready?.reject(error);
-    this.progress?.reject(error);
-    this.complete?.reject(error);
-    this.reset();
-  }
-
-  reset(): void {
-    this.ready = null;
-    this.progress = null;
-    this.complete = null;
-    this.progressQueue = [];
-    this.progressQueueHead = 0;
-  }
-
-  private compactProgressQueue(): void {
-    if (this.progressQueueHead > 32 && this.progressQueueHead * 2 > this.progressQueue.length) {
-      this.progressQueue = this.progressQueue.slice(this.progressQueueHead);
-      this.progressQueueHead = 0;
-    }
-  }
-}
+export { shouldFallbackToDownload, type EditReadErrorCode };
 
 export class SFTPPanel {
   private container: HTMLElement;
   private currentPath: string = '/';
   private entries: SFTPFileEntry[] = [];
   private renderedEntries: SFTPFileEntry[] = [];
+  private sortOptions: SFTPSortOptions = { field: 'name', direction: 'asc' };
   private selectedEntries: Map<string, SFTPFileEntry> = new Map();
   private selectionAnchorIndex: number | null = null;
   private pendingDeleteCount = 0;
@@ -145,7 +67,6 @@ export class SFTPPanel {
   private sftpReady: boolean = false;
   private downloadChunks: Uint8Array[] = [];
   private downloadFilename: string = '';
-  private downloadSize: number = 0;
   private uploadCancelRequested: boolean = false;
   private uploadCancelConfirmed: boolean = false;
   private uploadCancelWaiter: Deferred<void> | null = null;
@@ -162,6 +83,11 @@ export class SFTPPanel {
   private downloadActive: boolean = false;
   private downloadCancelRequested: boolean = false;
   private downloadQueueGeneration: number = 0;
+  private readonly editorCoordinator: SFTPEditorCoordinator;
+
+  get activeEditor(): ActiveEditorSession | null {
+    return this.editorCoordinator.getActiveEditor();
+  }
   private localeCleanup: (() => void) | null = null;
   private readonly keydownHandler = (e: KeyboardEvent): void => {
     if (!this.visible || document.querySelector('dialog[open]')) return;
@@ -182,6 +108,21 @@ export class SFTPPanel {
     this.getWebSocketUrl = getWebSocketUrl;
     this.container = this.createPanel();
     document.body.appendChild(this.container);
+
+    this.editorCoordinator = new SFTPEditorCoordinator({
+      isSftpReady: () => this.sftpReady,
+      isVisible: () => this.visible,
+      sendJSON: (data) => this.sendJSON(data),
+      // 编辑器保存路径显式声明 options.overwriteFirst: true（由 SFTPEditorCoordinator 执行）
+      enqueueUploadTask: (file, path, opts) => this.enqueueUploadTask(file, path, opts),
+      queueDownloadFile: (path, filename) => this.queueDownloadFile(path, filename),
+      refresh: () => this.refresh(),
+      setStatus: (s) => this.setStatus(s),
+      setIdleStatus: (s) => this.setIdleStatus(s),
+      getItemsStatus: () => this.getItemsStatus(),
+      showError: (msg) => this.showError(msg),
+    });
+
     this.localeCleanup = onLocaleChange(() => {
       translateDocument(this.container);
       this.hideContextMenu();
@@ -194,9 +135,10 @@ export class SFTPPanel {
     panel.id = 'sftp-panel';
     panel.className =
       'fixed top-0 right-0 h-full z-[90] flex transition-transform duration-300 ease-in-out';
-    panel.style.width = 'min(420px, 100vw)';
+    panel.style.width = 'min(clamp(420px, 40vw, 600px), 100vw)';
     panel.style.transform = 'translateX(100%)';
 
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     panel.innerHTML = `
       <div class="flex flex-col w-full h-full bg-surface border-l border-outline-variant text-on-surface">
         <!-- Header -->
@@ -212,26 +154,33 @@ export class SFTPPanel {
 
         <!-- Toolbar -->
         <div class="sftp-panel-toolbar flex items-center gap-2 px-3 py-2 border-b border-outline-variant bg-surface shrink-0">
-          <button id="sftp-back-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer" data-i18n-title="sftp.back" title="返回上一级">
+          <button id="sftp-back-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer shrink-0" data-i18n-title="sftp.back" title="返回上一级">
             <span class="material-symbols-outlined" style="font-size: 18px;">arrow_back</span>
           </button>
-          <button id="sftp-home-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer" data-i18n-title="sftp.home" title="主目录">
+          <button id="sftp-home-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer shrink-0" data-i18n-title="sftp.home" title="主目录">
             <span class="material-symbols-outlined" style="font-size: 18px;">home</span>
           </button>
-          <button id="sftp-refresh-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer" data-i18n-title="sftp.refresh" title="刷新">
+          <button id="sftp-refresh-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer shrink-0" data-i18n-title="sftp.refresh" title="刷新">
             <span class="material-symbols-outlined" style="font-size: 18px;">refresh</span>
           </button>
-          <input id="sftp-path-input" class="flex-1 terminal-input text-[12px] px-2 py-1" type="text" value="/" />
-          <button id="sftp-go-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer text-primary-container" data-i18n-title="sftp.go" title="前往">
+          <div id="sftp-path-bar" class="flex-1 relative flex items-center min-w-0 h-[28px] rounded border border-outline-variant bg-surface-variant/20 focus-within:border-primary-container overflow-hidden">
+            <div id="sftp-breadcrumbs" class="flex items-center gap-0.5 px-2 text-[12px] overflow-x-auto no-scrollbar w-full h-full select-none cursor-text"></div>
+            <input id="sftp-path-input" class="hidden w-full h-full bg-transparent px-2 text-[12px] font-code outline-none terminal-input border-0" type="text" value="/" />
+          </div>
+          <button id="sftp-go-btn" class="p-1 hover:bg-surface-variant rounded transition-colors cursor-pointer text-primary-container shrink-0" data-i18n-title="sftp.go" title="前往">
             <span class="material-symbols-outlined" style="font-size: 18px;">arrow_forward</span>
           </button>
         </div>
 
         <!-- Actions Bar -->
-        <div class="sftp-panel-actions flex items-center gap-1 px-3 py-1.5 border-b border-outline-variant bg-surface shrink-0">
+        <div class="sftp-panel-actions flex items-center gap-1 px-3 py-1.5 border-b border-outline-variant bg-surface shrink-0 overflow-x-auto no-scrollbar">
           <button id="sftp-upload-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-surface-variant rounded transition-colors cursor-pointer text-primary-container" data-i18n-title="sftp.upload" title="上传文件">
             <span class="material-symbols-outlined" style="font-size: 14px;">upload_file</span>
             <span data-i18n="sftp.uploadAction">上传文件</span>
+          </button>
+          <button id="sftp-new-file-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-surface-variant rounded transition-colors cursor-pointer text-primary-container" data-i18n-title="sftp.newFile" title="新建文件">
+            <span class="material-symbols-outlined" style="font-size: 14px;">note_add</span>
+            <span data-i18n="sftp.newFileAction">新建文件</span>
           </button>
           <button id="sftp-mkdir-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-surface-variant rounded transition-colors cursor-pointer text-secondary-container" data-i18n-title="sftp.newFolder" title="新建文件夹">
             <span class="material-symbols-outlined" style="font-size: 14px;">create_new_folder</span>
@@ -240,6 +189,10 @@ export class SFTPPanel {
           <button id="sftp-download-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-surface-variant rounded transition-colors cursor-pointer text-on-surface-variant disabled:opacity-30" data-i18n-title="sftp.download" title="下载" disabled>
             <span class="material-symbols-outlined" style="font-size: 14px;">download</span>
             <span data-i18n="sftp.downloadAction">下载</span>
+          </button>
+          <button id="sftp-edit-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-surface-variant rounded transition-colors cursor-pointer text-on-surface-variant disabled:opacity-30" data-i18n-title="sftp.edit" title="在线编辑" disabled>
+            <span class="material-symbols-outlined" style="font-size: 14px;">edit_note</span>
+            <span data-i18n="sftp.editAction">编辑</span>
           </button>
           <button id="sftp-delete-btn" class="flex items-center gap-1 px-2 py-1 text-[11px] font-bold tracking-wider hover:bg-error-container rounded transition-colors cursor-pointer text-error disabled:opacity-30" data-i18n-title="common.delete" title="删除" disabled>
             <span class="material-symbols-outlined" style="font-size: 14px;">delete</span>
@@ -266,6 +219,23 @@ export class SFTPPanel {
           <div class="w-full h-1.5 bg-surface-variant rounded-full overflow-hidden">
             <div id="sftp-progress-bar" class="h-full bg-primary-container rounded-full transition-all duration-200" style="width: 0%"></div>
           </div>
+        </div>
+
+        <!-- Table Header (Sortable) -->
+        <div id="sftp-table-header" class="flex items-center gap-2 px-3 py-1.5 border-b border-outline-variant bg-surface-variant/20 text-[11px] font-medium text-on-surface-variant select-none shrink-0">
+          <button id="sftp-sort-name" type="button" class="flex-1 flex items-center gap-1 hover:text-primary-container cursor-pointer transition-colors text-left" data-i18n-title="sftp.sortByName" title="按名称排序">
+            <span data-i18n="sftp.name">名称</span>
+            <span class="sftp-sort-icon material-symbols-outlined text-[14px]">arrow_upward</span>
+          </button>
+          <button id="sftp-sort-size" type="button" class="w-16 flex items-center justify-end gap-1 hover:text-primary-container cursor-pointer transition-colors text-right shrink-0" data-i18n-title="sftp.sortBySize" title="按大小排序">
+            <span data-i18n="sftp.size">大小</span>
+            <span class="sftp-sort-icon material-symbols-outlined text-[14px] hidden"></span>
+          </button>
+          <span class="w-20 text-right shrink-0 hidden md:block" data-i18n="sftp.permissions">权限</span>
+          <button id="sftp-sort-mtime" type="button" class="w-24 flex items-center justify-end gap-1 hover:text-primary-container cursor-pointer transition-colors text-right shrink-0 hidden lg:flex" data-i18n-title="sftp.sortByModified" title="按修改时间排序">
+            <span data-i18n="sftp.modified">修改时间</span>
+            <span class="sftp-sort-icon material-symbols-outlined text-[14px] hidden"></span>
+          </button>
         </div>
 
         <!-- File List -->
@@ -317,29 +287,58 @@ export class SFTPPanel {
     const refreshBtn = this.container.querySelector('#sftp-refresh-btn')!;
     const goBtn = this.container.querySelector('#sftp-go-btn')!;
     const uploadBtn = this.container.querySelector('#sftp-upload-btn')!;
+    const newFileBtn = this.container.querySelector('#sftp-new-file-btn')!;
     const mkdirBtn = this.container.querySelector('#sftp-mkdir-btn')!;
     const downloadBtn = this.container.querySelector('#sftp-download-btn')!;
+    const editBtn = this.container.querySelector('#sftp-edit-btn')!;
     const deleteBtn = this.container.querySelector('#sftp-delete-btn')!;
     const renameBtn = this.container.querySelector('#sftp-rename-btn')!;
     const cancelTransferBtn = this.container.querySelector('#sftp-transfer-cancel-btn')!;
     const fileInput = this.container.querySelector('#sftp-file-input') as HTMLInputElement;
     const pathInput = this.container.querySelector('#sftp-path-input') as HTMLInputElement;
+    const pathBar = this.container.querySelector('#sftp-path-bar');
 
     closeBtn.addEventListener('click', () => this.hide());
     backBtn.addEventListener('click', () => this.goBack());
     homeBtn.addEventListener('click', () => this.navigate('~'));
     refreshBtn.addEventListener('click', () => this.refresh());
-    goBtn.addEventListener('click', () => this.navigate(pathInput.value));
+    goBtn.addEventListener('click', () => {
+      this.navigate(pathInput.value);
+      this.showBreadcrumbs();
+    });
+    pathBar?.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('.sftp-crumb-item')) return;
+      this.showPathInput();
+    });
     pathInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') this.navigate(pathInput.value);
+      if (e.key === 'Enter') {
+        this.navigate(pathInput.value);
+        this.showBreadcrumbs();
+      } else if (e.key === 'Escape') {
+        this.showBreadcrumbs();
+      }
+    });
+    pathInput.addEventListener('blur', () => {
+      this.showBreadcrumbs();
     });
 
     uploadBtn.addEventListener('click', () => fileInput.click());
+    newFileBtn.addEventListener('click', () => this.showNewFileDialog());
     mkdirBtn.addEventListener('click', () => this.showMkdirDialog());
     downloadBtn.addEventListener('click', () => this.downloadSelected());
+    editBtn.addEventListener('click', () => this.editSelected());
     deleteBtn.addEventListener('click', () => this.deleteSelected());
     renameBtn.addEventListener('click', () => this.showRenameDialog());
     cancelTransferBtn.addEventListener('click', () => this.cancelCurrentTransfer());
+
+    const sortNameBtn = this.container.querySelector('#sftp-sort-name');
+    const sortSizeBtn = this.container.querySelector('#sftp-sort-size');
+    const sortMtimeBtn = this.container.querySelector('#sftp-sort-mtime');
+    sortNameBtn?.addEventListener('click', () => this.toggleSort('name'));
+    sortSizeBtn?.addEventListener('click', () => this.toggleSort('size'));
+    sortMtimeBtn?.addEventListener('click', () => this.toggleSort('mtime'));
+
+    this.renderBreadcrumbs(this.currentPath);
 
     fileInput.addEventListener('change', (e) => {
       const files = (e.target as HTMLInputElement).files;
@@ -385,6 +384,8 @@ export class SFTPPanel {
   }
 
   hide(): void {
+    this.closeActiveEditor();
+    this.resetEditState();
     this.resetUploadQueue();
     this.resetDownloadQueue();
     this.visible = false;
@@ -409,13 +410,14 @@ export class SFTPPanel {
 
   handleSSHReady(): void {
     this.closeWebSocket(1000, 'SSH session refreshed');
+    this.closeActiveEditor();
+    this.resetEditState();
     this.resetUploadQueue();
     this.resetDownloadQueue();
     this.uploadWaiter.reset();
     this.sftpReady = false;
     this.downloadChunks = [];
     this.downloadFilename = '';
-    this.downloadSize = 0;
     this.hideProgress();
     this.hideError();
 
@@ -577,7 +579,9 @@ export class SFTPPanel {
       this.closedByPanel.add(ws);
       try {
         ws.close(code, reason);
-      } catch {}
+      } catch {
+        /* 连接可能已关闭，close 抛出可忽略（幂等操作） */
+      }
     }
   }
 
@@ -593,11 +597,26 @@ export class SFTPPanel {
         this.onListResult(msg.path, msg.entries, msg.isTruncated);
         break;
       case 'sftp_stat_result':
+        this.editorCoordinator.onStatAttrs(msg.attrs);
         break;
       case 'pong':
         break;
       case 'sftp_download_start':
-        this.onDownloadStart(msg.filename, msg.size);
+        this.onDownloadStart(msg.filename);
+        break;
+      case 'sftp_edit_start':
+        this.editorCoordinator.onEditStart(
+          typeof msg.path === 'string' ? msg.path : '',
+          Number(msg.size) || 0,
+          Number(msg.mtime) || 0
+        );
+        break;
+      case 'sftp_edit_done':
+        this.editorCoordinator.onEditDone(
+          typeof msg.path === 'string' ? msg.path : '',
+          Number(msg.size) || 0,
+          Number(msg.mtime) || 0
+        );
         break;
       case 'sftp_download_progress':
         this.onDownloadProgress(msg.loaded, msg.total);
@@ -658,6 +677,20 @@ export class SFTPPanel {
   private handleSFTPError(msg: any): void {
     const operation = typeof msg.operation === 'string' ? msg.operation : '';
 
+    // 编辑器打开失败：由 openEditorForFile 统一 notify，避免双重报错；
+    // 无待决请求时才落到面板错误横幅
+    if (operation === 'edit') {
+      const hadPending = this.editorCoordinator.hasPendingEditRead();
+      const message = typeof msg.message === 'string' ? msg.message : '';
+      const code = msg.code === 'binary' || msg.code === 'too_large' ? msg.code : undefined;
+      this.editorCoordinator.onEditError(message, code, hadPending);
+      return;
+    }
+
+    if (operation === 'stat') {
+      this.editorCoordinator.onStatError();
+    }
+
     if (operation === 'init' || !this.sftpReady) {
       this.initializing = false;
       if (operation === 'init') {
@@ -689,6 +722,10 @@ export class SFTPPanel {
 
   // Handle binary data (download chunks)
   handleBinaryData(data: Uint8Array): void {
+    // 在线编辑读取与下载互斥使用同一条二进制流：编辑读取优先路由
+    if (this.editorCoordinator.handleBinaryData(data)) {
+      return;
+    }
     if (this.downloadFilename) {
       this.downloadChunks.push(data);
     }
@@ -726,7 +763,8 @@ export class SFTPPanel {
     this.entries = entries;
 
     const pathInput = this.container.querySelector('#sftp-path-input') as HTMLInputElement;
-    pathInput.value = path;
+    if (pathInput) pathInput.value = path;
+    this.renderBreadcrumbs(path);
 
     const warningEl = this.container.querySelector('#sftp-truncated-warning');
     if (warningEl) {
@@ -759,14 +797,11 @@ export class SFTPPanel {
     emptyState.classList.add('hidden');
     emptyState.classList.remove('flex');
 
-    // Sort: directories first, then by name
-    const sorted = [...this.entries].sort((a, b) => {
-      if (a.isDir && !b.isDir) return -1;
-      if (!a.isDir && b.isDir) return 1;
-      return a.name.localeCompare(b.name);
-    });
+    // Sort: directories first, then by chosen sortOptions
+    const sorted = sortSFTPEntries(this.entries, this.sortOptions);
     this.renderedEntries = sorted;
 
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     entriesContainer.innerHTML = sorted
       .map(
         (entry, idx) => `
@@ -792,24 +827,27 @@ export class SFTPPanel {
     entriesContainer.querySelectorAll('.sftp-entry').forEach((el) => {
       el.addEventListener('click', (e) => {
         const target = el as HTMLElement;
-        const idx = parseInt(target.dataset['idx']!);
+        const idx = parseInt(target.dataset.idx!, 10);
         this.selectEntry(idx, {
           additive: (e as MouseEvent).ctrlKey || (e as MouseEvent).metaKey,
           range: (e as MouseEvent).shiftKey,
         });
       });
 
-      el.addEventListener('dblclick', (e) => {
+      el.addEventListener('dblclick', () => {
         const target = el as HTMLElement;
-        const idx = parseInt(target.dataset['idx']!);
+        const idx = parseInt(target.dataset.idx!, 10);
         const entry = sorted[idx];
         if (entry.isDir) {
           this.navigate(
             this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`
           );
-        } else {
-          this.downloadEntries([entry]);
+          return;
         }
+        // 双击智能“打开”：可编辑候选先尝试编辑器，明确不可编辑（超大/二进制/无法解码）时自动转下载
+        const path =
+          this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`;
+        void this.openEditorForFile(path, entry.name, entry.size, { fallbackToDownload: true });
       });
 
       // Right-click context menu
@@ -817,7 +855,7 @@ export class SFTPPanel {
         const me = e as MouseEvent;
         me.preventDefault();
         const target = el as HTMLElement;
-        const idx = parseInt(target.dataset['idx']!);
+        const idx = parseInt(target.dataset.idx!, 10);
         const entry = sorted[idx];
         if (!this.selectedEntries.has(entry.name)) {
           this.selectEntry(idx, { additive: false, range: false });
@@ -867,7 +905,7 @@ export class SFTPPanel {
 
   private syncSelectionUI(): void {
     this.container.querySelectorAll<HTMLElement>('.sftp-entry').forEach((element) => {
-      const selected = this.selectedEntries.has(element.dataset['name'] || '');
+      const selected = this.selectedEntries.has(element.dataset.name || '');
       element.classList.toggle('bg-surface-variant', selected);
       element.setAttribute('aria-selected', String(selected));
     });
@@ -875,12 +913,14 @@ export class SFTPPanel {
 
   private updateActionButtons(): void {
     const downloadBtn = this.container.querySelector('#sftp-download-btn') as HTMLButtonElement;
+    const editBtn = this.container.querySelector('#sftp-edit-btn') as HTMLButtonElement;
     const deleteBtn = this.container.querySelector('#sftp-delete-btn') as HTMLButtonElement;
     const renameBtn = this.container.querySelector('#sftp-rename-btn') as HTMLButtonElement;
 
     const selected = [...this.selectedEntries.values()];
     const hasSelection = selected.length > 0;
     downloadBtn.disabled = !selected.some((entry) => !entry.isDir);
+    editBtn.disabled = !(selected.length === 1 && !selected[0].isDir);
     deleteBtn.disabled = !hasSelection;
     renameBtn.disabled = selected.length !== 1;
     this.setIdleStatus(
@@ -915,6 +955,19 @@ export class SFTPPanel {
           }
         },
       });
+      if (!entry.isDir) {
+        items.push({
+          label: t('sftp.contextEdit'),
+          icon: 'edit_note',
+          action: () => {
+            void this.openEditorForFile(
+              this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`,
+              entry.name,
+              entry.size
+            );
+          },
+        });
+      }
     }
     if (selected.some((selectedEntry) => !selectedEntry.isDir)) {
       items.push({
@@ -941,6 +994,7 @@ export class SFTPPanel {
       className: 'text-error',
     });
 
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     menu.innerHTML = items
       .map(
         (item) => `
@@ -993,45 +1047,58 @@ export class SFTPPanel {
     if (batch.length === 0) return;
 
     const targetPath = this.currentPath;
-    const generation = this.uploadQueueGeneration;
-    let queuedFilesAdded = 0;
-
     for (const file of batch) {
-      const queuedBehindExistingWork = this.uploadQueuePending > 0;
-      this.uploadQueuePending++;
-
-      if (queuedBehindExistingWork) {
-        this.uploadQueuedFiles++;
-        queuedFilesAdded++;
-      }
-
-      const run = this.uploadQueueTail.then(async () => {
-        if (queuedBehindExistingWork) {
-          this.uploadQueuedFiles = Math.max(0, this.uploadQueuedFiles - 1);
-          this.setQueueStatus();
-        }
-        if (generation !== this.uploadQueueGeneration || !this.visible) return;
-        await this.uploadSingleFile(file, targetPath);
-      });
-
-      this.uploadQueueTail = run
-        .catch((e) => {
-          this.showError(
-            t('sftp.uploadFailed', { message: e instanceof Error ? e.message : String(e) })
-          );
-        })
-        .finally(() => {
-          if (generation === this.uploadQueueGeneration) {
-            this.uploadQueuePending = Math.max(0, this.uploadQueuePending - 1);
-          }
-        });
+      void this.enqueueUploadTask(file, targetPath);
     }
+  }
 
-    if (queuedFilesAdded > 0) {
+  /**
+   * 入队一个上传任务（编辑器保存也走此通道，与普通上传串行复用单一上传状态机）。
+   * 返回是否真正完成上传（面板隐藏/队列重置时静默跳过返回 false）。
+   * reportError=false 表示由调用方自行报告错误（编辑器保存路径用 notify 呈现）。
+   */
+  private enqueueUploadTask(
+    file: File,
+    targetPath: string,
+    options: { overwriteFirst?: boolean; reportError?: boolean } = {}
+  ): Promise<boolean> {
+    const generation = this.uploadQueueGeneration;
+    const queuedBehindExistingWork = this.uploadQueuePending > 0;
+    this.uploadQueuePending++;
+
+    if (queuedBehindExistingWork) {
+      this.uploadQueuedFiles++;
       this.setQueueStatus();
     }
 
+    const run = this.uploadQueueTail.then(async () => {
+      if (queuedBehindExistingWork) {
+        this.uploadQueuedFiles = Math.max(0, this.uploadQueuedFiles - 1);
+        this.setQueueStatus();
+      }
+      if (generation !== this.uploadQueueGeneration || !this.visible) return false;
+      return this.uploadSingleFile(file, targetPath, options.overwriteFirst === true);
+    });
+
+    const tail: Promise<void> = run.then(
+      () => undefined,
+      (e) => {
+        if (options.reportError !== false) {
+          this.showError(
+            t('sftp.uploadFailed', { message: e instanceof Error ? e.message : String(e) })
+          );
+        }
+      }
+    );
+
+    this.uploadQueueTail = tail.finally(() => {
+      if (generation === this.uploadQueueGeneration) {
+        this.uploadQueuePending = Math.max(0, this.uploadQueuePending - 1);
+      }
+    });
+
     void this.uploadQueueTail;
+    return run;
   }
 
   private resetUploadQueue(): void {
@@ -1047,7 +1114,11 @@ export class SFTPPanel {
     this.uploadQueueTail = Promise.resolve();
   }
 
-  private async uploadSingleFile(file: File, targetPath: string): Promise<void> {
+  private async uploadSingleFile(
+    file: File,
+    targetPath: string,
+    overwriteFirst: boolean = false
+  ): Promise<boolean> {
     const path = targetPath === '/' ? `/${file.name}` : `${targetPath}/${file.name}`;
 
     let sendOffset = 0;
@@ -1065,7 +1136,7 @@ export class SFTPPanel {
 
     try {
       const readyPromise = this.uploadWaiter.waitReady();
-      this.sendJSON({ type: 'sftp_upload_start', path, size: file.size, overwrite: false });
+      this.sendJSON({ type: 'sftp_upload_start', path, size: file.size, overwrite: overwriteFirst });
       let startResult = await readyPromise;
 
       if (startResult.status === 'conflict') {
@@ -1083,7 +1154,7 @@ export class SFTPPanel {
         if (!confirmed || this.uploadCancelRequested || !this.visible) {
           this.uploadActive = false;
           this.setIdleStatus(t('sftp.uploadSkipped'));
-          return;
+          return false;
         }
 
         const overwriteReadyPromise = this.uploadWaiter.waitReady();
@@ -1099,7 +1170,7 @@ export class SFTPPanel {
       this.showProgress(t('sftp.uploading', { name: file.name }), 0);
       if (this.uploadCancelRequested) {
         await this.waitForUploadCancel();
-        return;
+        return false;
       }
 
       const readNextChunk = async (): Promise<Uint8Array | null> => {
@@ -1130,7 +1201,7 @@ export class SFTPPanel {
       while (sendOffset < file.size && sendOffset - acknowledged < maxBufferedBytes) {
         if (this.uploadCancelRequested) {
           await this.waitForUploadCancel();
-          return;
+          return false;
         }
         if (!(await sendNextChunk())) {
           throw new Error(t('sftp.uploadStreamEnded'));
@@ -1141,7 +1212,7 @@ export class SFTPPanel {
         acknowledged = await this.uploadWaiter.waitProgress();
         if (this.uploadCancelRequested) {
           await this.waitForUploadCancel();
-          return;
+          return false;
         }
         while (sendOffset < file.size && sendOffset - acknowledged < maxBufferedBytes) {
           if (!(await sendNextChunk())) {
@@ -1153,17 +1224,17 @@ export class SFTPPanel {
       const completePromise = this.uploadWaiter.waitComplete();
       this.sendJSON({ type: 'sftp_upload_end' });
       await completePromise;
+      return true;
     } catch (e) {
       if (this.uploadCancelRequested) {
         await this.waitForUploadCancel();
-      } else {
-        this.sendJSON({ type: 'sftp_upload_cancel' });
-        this.showError(
-          t('sftp.uploadFailed', { message: e instanceof Error ? e.message : String(e) })
-        );
+        this.uploadWaiter.reset();
+        return false;
       }
+      // 错误上报交由调用方（队列默认 showError / 编辑器保存路径 notify）
+      this.sendJSON({ type: 'sftp_upload_cancel' });
       this.uploadWaiter.reset();
-      return;
+      throw e;
     } finally {
       this.uploadActive = false;
       this.uploadCancelRequested = false;
@@ -1239,7 +1310,6 @@ export class SFTPPanel {
     this.downloadWaiter = new Deferred<void>();
     this.downloadChunks = [];
     this.downloadFilename = filename;
-    this.downloadSize = 0;
     this.sendJSON({ type: 'sftp_download', path });
     this.showProgress(t('sftp.downloading', { name: filename }), 0);
     try {
@@ -1252,9 +1322,8 @@ export class SFTPPanel {
     }
   }
 
-  private onDownloadStart(filename: string, size: number): void {
+  private onDownloadStart(filename: string): void {
     this.downloadFilename = filename;
-    this.downloadSize = size;
     this.downloadChunks = [];
     this.showProgress(t('sftp.downloading', { name: filename }), 0);
   }
@@ -1313,6 +1382,33 @@ export class SFTPPanel {
     this.downloadWaiter = null;
   }
 
+  // ==================== 在线编辑 ====================
+
+  private editSelected(): void {
+    const selected = [...this.selectedEntries.values()];
+    if (selected.length !== 1 || selected[0].isDir) return;
+    const entry = selected[0];
+    const path = this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`;
+    void this.openEditorForFile(path, entry.name, entry.size);
+  }
+
+  private openEditorForFile(
+    path: string,
+    filename: string,
+    knownSize: number,
+    options: { fallbackToDownload?: boolean } = {}
+  ): Promise<void> {
+    return this.editorCoordinator.openEditorForFile(path, filename, knownSize, options);
+  }
+
+  private closeActiveEditor(): void {
+    this.editorCoordinator.closeActiveEditor();
+  }
+
+  private resetEditState(): void {
+    this.editorCoordinator.resetEditState();
+  }
+
   private cancelCurrentTransfer(): void {
     if (this.uploadActive) {
       this.uploadCancelRequested = true;
@@ -1346,7 +1442,7 @@ export class SFTPPanel {
     this.uploadWaiter.resolveProgress(loaded);
   }
 
-  private onUploadComplete(path: string): void {
+  private onUploadComplete(_path: string): void {
     this.uploadWaiter.resolveComplete();
     this.uploadActive = false;
     this.uploadCancelRequested = false;
@@ -1392,16 +1488,7 @@ export class SFTPPanel {
     const entries = [...this.selectedEntries.values()];
     if (entries.length === 0) return;
 
-    const confirmed = await confirmAction({
-      title: t('sftp.deleteTitle'),
-      message:
-        entries.length === 1
-          ? t('sftp.deleteMessage', { name: entries[0].name })
-          : t('sftp.deleteManyMessage', { count: entries.length }),
-      confirmText: t('common.delete'),
-      cancelText: t('common.cancel'),
-      variant: 'danger',
-    });
+    const confirmed = await confirmDeleteItems(entries.map((e) => e.name));
     if (!confirmed) return;
 
     this.pendingDeleteCount = entries.length;
@@ -1427,16 +1514,7 @@ export class SFTPPanel {
     if (selected.length !== 1) return;
     const entry = selected[0];
 
-    const newName = await requestText({
-      title: t('sftp.renameTitle'),
-      message: t('sftp.renameMessage', { name: entry.name }),
-      label: t('sftp.name'),
-      defaultValue: entry.name,
-      confirmText: t('sftp.rename'),
-      cancelText: t('common.cancel'),
-      maxLength: 255,
-      validate: validateRemoteName,
-    });
+    const newName = await promptRename(entry.name);
     if (!newName || newName === entry.name) return;
 
     const oldPath =
@@ -1452,18 +1530,116 @@ export class SFTPPanel {
     this.refresh();
   }
 
+  // Sorting
+  private toggleSort(field: SFTPSortField): void {
+    if (this.sortOptions.field === field) {
+      this.sortOptions.direction = this.sortOptions.direction === 'asc' ? 'desc' : 'asc';
+    } else {
+      this.sortOptions.field = field;
+      this.sortOptions.direction = field === 'name' ? 'asc' : 'desc';
+    }
+    this.updateSortHeaderUI();
+    this.renderEntries();
+  }
+
+  private updateSortHeaderUI(): void {
+    const fields: SFTPSortField[] = ['name', 'size', 'mtime'];
+    for (const f of fields) {
+      const btn = this.container.querySelector(`#sftp-sort-${f}`);
+      if (!btn) continue;
+      const icon = btn.querySelector('.sftp-sort-icon') as HTMLElement | null;
+      if (!icon) continue;
+
+      if (this.sortOptions.field === f) {
+        icon.classList.remove('hidden');
+        icon.textContent = this.sortOptions.direction === 'asc' ? 'arrow_upward' : 'arrow_downward';
+        btn.classList.add('text-primary-container');
+        btn.classList.remove('text-on-surface-variant');
+      } else {
+        icon.classList.add('hidden');
+        btn.classList.remove('text-primary-container');
+        btn.classList.add('text-on-surface-variant');
+      }
+    }
+  }
+
+  // Breadcrumbs
+  private renderBreadcrumbs(path: string): void {
+    const breadcrumbsEl = this.container.querySelector('#sftp-breadcrumbs');
+    if (!breadcrumbsEl) return;
+
+    const crumbs = parsePathBreadcrumbs(path);
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    breadcrumbsEl.innerHTML = crumbs
+      .map((crumb, idx) => {
+        const isLast = idx === crumbs.length - 1;
+        const isRoot = idx === 0;
+        return `
+          <button type="button" class="sftp-crumb-item flex items-center px-1 py-0.5 rounded hover:bg-surface-variant text-[12px] cursor-pointer transition-colors ${isLast ? 'text-primary-container font-semibold' : 'text-on-surface-variant'}" data-path="${this.escapeHtml(crumb.path)}" title="${this.escapeHtml(crumb.path)}">
+            ${isRoot ? '<span class="material-symbols-outlined" style="font-size: 15px; font-variation-settings: \'FILL\' 1;">storage</span>' : this.escapeHtml(crumb.name)}
+          </button>
+          ${isLast ? '' : '<span class="text-on-surface-variant/40 text-[10px] select-none mx-0.5">/</span>'}
+        `;
+      })
+      .join('');
+
+    breadcrumbsEl.querySelectorAll('.sftp-crumb-item').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const targetPath = (el as HTMLElement).dataset.path;
+        if (targetPath && targetPath !== this.currentPath) {
+          this.navigate(targetPath);
+        }
+      });
+    });
+  }
+
+  private showPathInput(): void {
+    const breadcrumbsEl = this.container.querySelector('#sftp-breadcrumbs');
+    const pathInput = this.container.querySelector('#sftp-path-input') as HTMLInputElement | null;
+    if (!breadcrumbsEl || !pathInput) return;
+    breadcrumbsEl.classList.add('hidden');
+    pathInput.classList.remove('hidden');
+    pathInput.value = this.currentPath;
+    pathInput.focus();
+    pathInput.select();
+  }
+
+  private showBreadcrumbs(): void {
+    const breadcrumbsEl = this.container.querySelector('#sftp-breadcrumbs');
+    const pathInput = this.container.querySelector('#sftp-path-input') as HTMLInputElement | null;
+    if (!breadcrumbsEl || !pathInput) return;
+    pathInput.classList.add('hidden');
+    breadcrumbsEl.classList.remove('hidden');
+  }
+
+  // New File
+  private async showNewFileDialog(): Promise<void> {
+    const name = await promptNewFileName();
+    if (!name) return;
+
+    const path = this.currentPath === '/' ? `/${name}` : `${this.currentPath}/${name}`;
+    const emptyFile = new File([new Uint8Array(0)], name, { type: 'text/plain' });
+
+    try {
+      const ok = await this.enqueueUploadTask(emptyFile, this.currentPath, {
+        overwriteFirst: false,
+        reportError: true,
+      });
+      if (!ok) return;
+
+      this.refresh();
+      await this.openEditorForFile(path, name, 0);
+    } catch (e) {
+      notify(t('sftp.newFileFailed', { message: e instanceof Error ? e.message : String(e) }), {
+        variant: 'danger',
+      });
+    }
+  }
+
   // Mkdir
   private async showMkdirDialog(): Promise<void> {
-    const name = await requestText({
-      title: t('sftp.mkdirTitle'),
-      message: t('sftp.mkdirMessage'),
-      label: t('sftp.name'),
-      placeholder: t('sftp.mkdirMessage'),
-      confirmText: t('common.confirm'),
-      cancelText: t('common.cancel'),
-      maxLength: 255,
-      validate: validateRemoteName,
-    });
+    const name = await promptMkdirName();
     if (!name) return;
 
     const path = this.currentPath === '/' ? `/${name}` : `${this.currentPath}/${name}`;
@@ -1567,7 +1743,7 @@ export class SFTPPanel {
     (this.container.querySelector('#sftp-status-text') as HTMLElement).textContent = text;
   }
 
-  private updateItemCount(count: number): void {
+  private updateItemCount(_count: number): void {
     const dirs = this.entries.filter((e) => e.isDir).length;
     const files = this.entries.filter((e) => !e.isDir).length;
     (this.container.querySelector('#sftp-item-count') as HTMLElement).textContent = t(
@@ -1581,120 +1757,19 @@ export class SFTPPanel {
   }
 
   private getFileIcon(filename: string): string {
-    const ext = filename.split('.').pop()?.toLowerCase() || '';
-    switch (ext) {
-      case 'js':
-      case 'ts':
-      case 'jsx':
-      case 'tsx':
-        return 'javascript';
-      case 'py':
-        return 'code';
-      case 'sh':
-      case 'bash':
-      case 'zsh':
-        return 'terminal';
-      case 'json':
-      case 'yaml':
-      case 'yml':
-      case 'toml':
-        return 'data_object';
-      case 'md':
-      case 'txt':
-      case 'log':
-        return 'description';
-      case 'png':
-      case 'jpg':
-      case 'jpeg':
-      case 'gif':
-      case 'svg':
-      case 'webp':
-        return 'image';
-      case 'mp4':
-      case 'mkv':
-      case 'avi':
-      case 'mov':
-        return 'movie';
-      case 'mp3':
-      case 'wav':
-      case 'ogg':
-        return 'audio_file';
-      case 'zip':
-      case 'tar':
-      case 'gz':
-      case 'bz2':
-      case 'xz':
-      case '7z':
-        return 'folder_zip';
-      case 'pdf':
-        return 'picture_as_pdf';
-      case 'html':
-      case 'htm':
-        return 'html';
-      case 'css':
-      case 'scss':
-      case 'less':
-        return 'css';
-      case 'go':
-        return 'code';
-      case 'rs':
-        return 'code';
-      case 'c':
-      case 'h':
-      case 'cpp':
-      case 'hpp':
-        return 'code';
-      case 'java':
-      case 'kt':
-        return 'code';
-      case 'rb':
-        return 'code';
-      case 'php':
-        return 'code';
-      case 'sql':
-        return 'database';
-      case 'xml':
-        return 'code';
-      case 'conf':
-      case 'cfg':
-      case 'ini':
-      case 'env':
-        return 'settings';
-      default:
-        return 'draft';
-    }
+    return getFileIcon(filename);
   }
 
   private formatSize(bytes: number): string {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+    return formatSize(bytes);
   }
 
   private formatTimestamp(unixTime: number): string {
-    if (!unixTime) return '';
-
-    const date = new Date(unixTime * 1000);
-    const now = new Date();
-    const sixMonthsAgo = new Date(now);
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
-    const pad = (n: number) => n.toString().padStart(2, '0');
-
-    if (date > sixMonthsAgo) {
-      return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    }
-
-    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${date.getFullYear()}`;
+    return formatTimestamp(unixTime);
   }
 
   private escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+    return escapeHtml(str);
   }
 
   dispose(): void {
@@ -1702,6 +1777,7 @@ export class SFTPPanel {
     this.localeCleanup = null;
     this.resetUploadQueue();
     this.resetDownloadQueue();
+    this.editorCoordinator.dispose();
     this.closeWebSocket(1000, 'SFTP panel disposed');
     document.removeEventListener('keydown', this.keydownHandler);
     this.container.remove();

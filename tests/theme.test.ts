@@ -4,6 +4,9 @@ import {
   applyBuiltInTheme,
   applyImportedTheme,
   BUILT_IN_APPEARANCE,
+  BUILT_IN_BACKGROUND,
+  BUILT_IN_EFFECTS,
+  BUILT_IN_TYPOGRAPHY,
   getActiveColorScheme,
   getActiveTerminalTheme,
   getActiveThemeAppearance,
@@ -11,6 +14,7 @@ import {
   normalizeImportedTheme,
   onColorSchemeChange,
   onTerminalThemeChange,
+  resolveBackgroundCss,
   resolveThemeAppearance,
   THEME_SCHEMA_VERSION,
   THEMES,
@@ -69,7 +73,7 @@ describe('Standard 内置主题', () => {
       'brightWhite',
     ] as const;
 
-    for (const themeName of ['standard-dark', 'standard-light'] as const) {
+    for (const themeName of ['standard-dark', 'standard-light', 'apple', 'crt', 'glass'] as const) {
       for (const key of ansiKeys) {
         expect(THEMES[themeName][key]).toMatch(/^#[0-9a-f]{6}$/i);
       }
@@ -77,7 +81,7 @@ describe('Standard 内置主题', () => {
   });
 
   it('主要文本、次要文本和强调色达到普通文字 4.5:1 对比度', () => {
-    for (const themeName of ['standard-dark', 'standard-light'] as const) {
+    for (const themeName of ['standard-dark', 'standard-light', 'apple', 'crt', 'glass'] as const) {
       const ui = UI_THEMES[themeName];
       for (const foreground of ['--text', '--text-muted', '--text-dim', '--accent', '--error']) {
         expect(contrastRatio(ui[foreground], ui['--bg'])).toBeGreaterThanOrEqual(4.5);
@@ -129,13 +133,15 @@ describe('Theme V2 界面风格', () => {
   afterEach(() => applyBuiltInTheme('cyberpunk'));
 
   it('提供版本化外观结构，并让内置主题覆盖四种风格', () => {
-    expect(THEME_SCHEMA_VERSION).toBe(2);
+    expect(THEME_SCHEMA_VERSION).toBe(3);
     expect(BUILT_IN_APPEARANCE).toEqual({
       'standard-dark': { style: 'standard' },
       'standard-light': { style: 'standard' },
       cyberpunk: { style: 'cyberpunk' },
-      glacier: { style: 'soft' },
+      apple: { style: 'soft' },
       gruvbox: { style: 'dense' },
+      crt: { style: 'cyberpunk' },
+      glass: { style: 'soft', blur: 'strong' },
     });
     expect(Object.keys(UI_STYLE_PRESETS).sort()).toEqual([
       'cyberpunk',
@@ -146,7 +152,7 @@ describe('Theme V2 界面风格', () => {
   });
 
   it('切换内置主题会同步形状、密度、字体、阴影、动效和组件风格', () => {
-    applyBuiltInTheme('glacier');
+    applyBuiltInTheme('apple');
     expect(getActiveThemeAppearance()).toEqual({
       style: 'soft',
       shape: 'soft',
@@ -154,6 +160,7 @@ describe('Theme V2 界面风格', () => {
       font: 'system',
       shadow: 'elevated',
       motion: 'reduced',
+      blur: 'strong',
       components: {
         button: 'soft',
         input: 'boxed',
@@ -196,6 +203,7 @@ describe('Theme V2 界面风格', () => {
       font: 'mono',
       shadow: 'none',
       motion: 'none',
+      blur: 'strong',
       components: {
         button: 'solid',
         input: 'underline',
@@ -235,7 +243,7 @@ describe('Theme V2 界面风格', () => {
       normalizeImportedTheme({
         schemaVersion: 999,
         name: ' My Theme ',
-        baseTheme: 'glacier',
+        baseTheme: 'gruvbox',
         colorScheme: 'dark',
         ui: {
           '--accent': '#abcdef',
@@ -248,15 +256,34 @@ describe('Theme V2 界面风格', () => {
         },
       })
     ).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       name: 'My Theme',
-      baseTheme: 'glacier',
+      baseTheme: 'gruvbox',
       colorScheme: 'dark',
       ui: { '--accent': '#abcdef' },
       appearance: {
         shape: 'soft',
         components: { button: 'solid' },
       },
+    });
+  });
+
+  it('旧版 glacier 基础主题优雅降级：字段被丢弃但主题仍可导入', () => {
+    expect(
+      normalizeImportedTheme({
+        schemaVersion: 2,
+        name: 'Legacy Glacier Custom',
+        baseTheme: 'glacier',
+        colorScheme: 'dark',
+        ui: { '--accent': '#67e8f9' },
+        appearance: { style: 'soft' },
+      })
+    ).toEqual({
+      schemaVersion: 3,
+      name: 'Legacy Glacier Custom',
+      colorScheme: 'dark',
+      ui: { '--accent': '#67e8f9' },
+      appearance: { style: 'soft' },
     });
   });
 
@@ -297,6 +324,8 @@ describe('Standard 主题入口和编辑器', () => {
     {
       ui: Record<string, string>;
       appearance: Record<string, unknown>;
+      background?: Record<string, unknown>;
+      effects?: Record<string, number>;
     }
   >;
 
@@ -314,8 +343,10 @@ describe('Standard 主题入口和编辑器', () => {
     expect(appHtml.match(/data-theme-import/g)).toHaveLength(3);
     expect(appHtml).not.toContain('data-theme-export');
     expect(appHtml).not.toContain('data-theme-delete');
-    expect(appHtml).toContain('Glacier · Soft');
+    expect(appHtml).toContain('Apple · Soft');
     expect(appHtml).toContain('Gruvbox · Dense');
+    expect(appHtml).toContain('CRT Amber');
+    expect(appHtml).toContain('Glass · Soft');
   });
 
   it('Pages 保持独立，应用为登录用户同步单个自定义主题', () => {
@@ -327,6 +358,9 @@ describe('Standard 主题入口和编辑器', () => {
     expect(mainSource).toContain(
       'void restoreCloudTheme(initialThemeSelection, themeSelectionRevision)'
     );
+    // glacier 已被 Apple 取代：旧选择在恢复时迁移到 Standard Dark，避免静默回退到默认主题
+    expect(mainSource).toContain("selection === 'glacier'");
+    expect(mainSource).toContain("'standard-dark'");
     expect(workerSource).toContain("url.pathname === '/api/user/theme'");
     expect(userDbSource).toContain('CREATE TABLE IF NOT EXISTS user_themes');
     expect(userDbSource).not.toContain('handleDeleteTheme');
@@ -358,8 +392,10 @@ describe('Standard 主题入口和编辑器', () => {
       'standard-dark',
       'standard-light',
       'cyberpunk',
-      'glacier',
+      'apple',
       'gruvbox',
+      'crt',
+      'glass',
     ]) {
       expect(editorHtml).toContain(`<option value="${themeName}"`);
     }
@@ -385,7 +421,7 @@ describe('Standard 主题入口和编辑器', () => {
     for (const field of ['button', 'input', 'card', 'tabs']) {
       expect(editorHtml).toContain(`key: '${field}'`);
     }
-    expect(editorHtml).toContain('schemaVersion: 2');
+    expect(editorHtml).toContain('schemaVersion: 3');
     expect(editorHtml).toContain('baseTheme: activePreset');
     expect(editorHtml).toContain('sanitizeAppearance(data.appearance)');
     expect(editorHtml).toContain('file.size > THEME_MAX_BYTES');
@@ -395,15 +431,109 @@ describe('Standard 主题入口和编辑器', () => {
     expect(editorHtml).toContain('ui: safeUiTheme');
     expect(editorHtml).not.toContain('transition: all');
     expect(THEME_MAX_BYTES).toBe(64 * 1024);
-    expect(editorPresets.glacier.appearance).toMatchObject({
+    expect(editorPresets.apple.appearance).toMatchObject({
       style: 'soft',
       shape: 'soft',
       density: 'comfortable',
     });
+    expect(editorPresets.crt.background).toMatchObject({ type: 'radial' });
+    expect(editorPresets.glass.background).toMatchObject({ type: 'mesh', animation: 'drift' });
+    expect(editorPresets.glass.appearance).toMatchObject({ blur: 'strong' });
   });
 
   it('终端订阅全局主题并在销毁时解除订阅', () => {
     expect(terminalSource).toContain('onTerminalThemeChange((theme)');
     expect(terminalSource).toContain('this.themeCleanup()');
+  });
+});
+
+describe('Theme V3 背景层、效果与版式', () => {
+  afterEach(() => applyBuiltInTheme('cyberpunk'));
+
+  it('四种背景类型合成安全 CSS 渐变串，缺省/纯色回退基色', () => {
+    expect(resolveBackgroundCss(undefined)).toBe('var(--bg)');
+    expect(
+      resolveBackgroundCss({ type: 'solid', stops: ['#0a0a0a'], angle: 0, scrim: 0, animation: 'none' })
+    ).toBe('var(--bg)');
+    expect(
+      resolveBackgroundCss({
+        type: 'linear',
+        stops: ['#0a0a0a', '#11170c'],
+        angle: 165,
+        scrim: 0.3,
+        animation: 'none',
+      })
+    ).toBe('linear-gradient(165deg, #0a0a0a, #11170c)');
+    expect(
+      resolveBackgroundCss({
+        type: 'radial',
+        stops: ['#261b00', '#0f0a00'],
+        angle: 160,
+        scrim: 0.3,
+        animation: 'none',
+      })
+    ).toContain('radial-gradient(ellipse at 50% 25%, #261b00, #0f0a00)');
+    expect(
+      resolveBackgroundCss({
+        type: 'mesh',
+        stops: ['#d3e3f8', '#e8edf5', '#ece0f6'],
+        angle: 135,
+        scrim: 0.35,
+        animation: 'drift',
+      })
+    ).toMatch(/^radial-gradient\(at 18% 22%, #d3e3f8 0px, transparent 55%\), radial-gradient/);
+  });
+
+  it('背景停靠点过白名单并截断到 5 个，渐变强制读性遮罩下限', () => {
+    const normalized = normalizeImportedTheme({
+      background: {
+        type: 'linear',
+        stops: ['#0a0a0a', '#11170c', '#1a2410', '#223018', '#2a3a20', '#324428'],
+        angle: 999,
+        scrim: -1,
+        animation: 'invalid',
+      },
+    });
+    expect(normalized?.background?.stops).toHaveLength(5);
+    expect(normalized?.background?.angle).toBe(360);
+    expect(normalized?.background?.scrim).toBeGreaterThanOrEqual(0.25);
+    expect(normalized?.background?.animation).toBe('none');
+
+    const light = normalizeImportedTheme({
+      colorScheme: 'light',
+      background: { type: 'mesh', stops: ['#d3e3f8', '#e8edf5'], angle: 135, scrim: 0, animation: 'none' },
+    });
+    expect(light?.background?.scrim).toBeGreaterThanOrEqual(0.35);
+
+    const unsafe = normalizeImportedTheme({
+      background: {
+        type: 'linear',
+        stops: ['url(https://tracker.example/x.png)'],
+        angle: 160,
+        scrim: 0.3,
+        animation: 'none',
+      },
+    });
+    expect(unsafe?.background).toBeUndefined();
+  });
+
+  it('效果强度钩制在 0-1 且零值不导出，版式缩放钩制到安全区间', () => {
+    const normalized = normalizeImportedTheme({
+      effects: { scanline: 5, flicker: -1, glow: 0.4, noise: 0 },
+      typography: { fontScale: 99, radiusScale: 0.01 },
+    });
+    expect(normalized?.effects).toEqual({ scanline: 1, glow: 0.4 });
+    expect(normalized?.typography).toEqual({ fontScale: 1.25, radiusScale: 0.5 });
+    expect(normalizeImportedTheme({ effects: { glow: 0 } })).toBeNull();
+  });
+
+  it('内置主题携带差异化的背景、效果与版式配置', () => {
+    expect(BUILT_IN_BACKGROUND.crt?.type).toBe('radial');
+    expect(BUILT_IN_BACKGROUND.glass?.type).toBe('mesh');
+    expect(BUILT_IN_BACKGROUND.glass?.animation).toBe('drift');
+    expect(BUILT_IN_EFFECTS.cyberpunk).toEqual({ scanline: 1, flicker: 1 });
+    expect(BUILT_IN_EFFECTS.crt?.glow).toBeGreaterThan(0);
+    expect(BUILT_IN_TYPOGRAPHY.glass?.radiusScale).toBeGreaterThan(1);
+    expect(BUILT_IN_BACKGROUND['standard-dark']).toBeUndefined();
   });
 });

@@ -7,6 +7,8 @@ import { TrzszFilter } from 'trzsz';
 import '@xterm/xterm/css/xterm.css';
 import { AuthChallengeDialog, type AuthChallengeSubmission } from './auth-challenge-dialog';
 import { copyTextToClipboard } from './clipboard';
+import { createResumeChallengeParams, hasDeviceBindingSupport } from './device-identity';
+import { SHARE_RESUME_RETRY_WINDOW_MS } from '../../src/share-resume-schema';
 import { type TranslationKey, t } from './i18n';
 import {
   type ChangedHostKeyMessage,
@@ -70,12 +72,41 @@ export interface TerminalSelectionAnchor {
   clientY: number;
 }
 
+export type TerminalShortcutAction = 'search' | 'clear';
+
+/**
+ * 匹配终端快捷键：
+ * - 搜索：Ctrl+Shift+F（通用）或 Cmd+F（macOS）
+ * - 清屏/清除滚动缓冲区：Cmd+K（macOS）或 Ctrl+Shift+K（Win/Linux）
+ */
+export function matchTerminalShortcut(
+  e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'shiftKey' | 'altKey'>
+): TerminalShortcutAction | null {
+  const key = e.key.toLowerCase();
+  const isSearchShortcut =
+    (e.ctrlKey && e.shiftKey && key === 'f') ||
+    (e.metaKey && !e.ctrlKey && !e.altKey && key === 'f');
+  if (isSearchShortcut) return 'search';
+
+  const isClearShortcut =
+    (e.metaKey && !e.ctrlKey && !e.altKey && key === 'k') ||
+    (e.ctrlKey && e.shiftKey && key === 'k');
+  if (isClearShortcut) return 'clear';
+
+  return null;
+}
+
+/** 末次恢复尝试所需的最小窗口余量：预留一次握手往返，避免注定失败的冲刺。 */
+const RESUME_FINAL_ATTEMPT_MARGIN_MS = 3000;
+
 interface ConnectOptions {
   resetDisplay?: boolean;
 }
 
 interface WebSocketConnectOptions extends ConnectOptions {
   reconnectFactory?: ReconnectWebSocketFactory;
+  /** resume-only：仅允许秒级恢复，不回退完整重连（分享会话 ticket 已一次性消费）。 */
+  resumeOnly?: boolean;
 }
 
 interface TerminalCell {
@@ -160,6 +191,20 @@ export class SSHTerminal {
   private viewportRestoreFrame: number | null = null;
   private readonly mobileConnectionRecoveryEnabled: boolean;
   private pendingHostKeyChangeSocket: WebSocket | null = null;
+  private activeSessionId: string | null = null;
+  private activeResumeToken: string | null = null;
+  /** 分享会话专用：断线后只走秒级恢复路径，失败则宣告分享结束。 */
+  private resumeOnlyMode: boolean = false;
+  /** 当前断线周期的分享恢复截止时刻（对齐服务端宽限窗口）；null 表示尚未开始计时。 */
+  private shareResumeDeadline: number | null = null;
+  /** 恢复时无法生成设备验证材料（隐私模式/站点数据清理）；用于一次性提示。 */
+  private shareResumeChallengeMissing = false;
+  /** 服务端在 session_created 中声明的设备绑定状态：绑定会话的恢复需挑战签名。 */
+  private sessionRequiresDeviceSig = false;
+  /** 服务端已因到期等原因终结分享会话：停止无效重试并给出终态提示。 */
+  private shareSessionEndedByServer = false;
+  /** 分享会话是否具备断线恢复资格（未绑定设备身份的环境为 false）。 */
+  private shareResumeSupported = true;
   private readonly contextMenuPasteListener = async (event: MouseEvent): Promise<void> => {
     if (window.matchMedia?.('(pointer: coarse)').matches) return;
     event.preventDefault();
@@ -296,15 +341,27 @@ export class SSHTerminal {
     window.addEventListener('pointerup', this.selectionPointerUpListener, true);
     window.addEventListener('pointercancel', this.selectionPointerCancelListener, true);
 
-    // Ctrl+Shift+F to toggle search bar
+    // Terminal shortcuts: Search (Ctrl+Shift+F / Cmd+F) & Clear Buffer (Cmd+K / Ctrl+Shift+K)
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
-        e.preventDefault();
-        this.toggleSearch();
+      const action = matchTerminalShortcut(e);
+      if (action === 'search') {
+        if (e.type === 'keydown') {
+          e.preventDefault();
+          this.toggleSearch();
+        }
+        return false;
+      }
+      if (action === 'clear') {
+        if (e.type === 'keydown') {
+          e.preventDefault();
+          this.clearBuffer();
+        }
         return false;
       }
       if (e.key === 'Escape' && this.searchVisible) {
-        this.hideSearch();
+        if (e.type === 'keydown') {
+          this.hideSearch();
+        }
         return false;
       }
       return true;
@@ -721,7 +778,7 @@ export class SSHTerminal {
   private createSearchButton(
     extraClass: string,
     titleKey: TranslationKey,
-    icon: string,
+    icon: string
   ): HTMLButtonElement {
     const button = document.createElement('button');
     button.className = `cloudssh-search-btn ${extraClass}`;
@@ -738,7 +795,7 @@ export class SSHTerminal {
     target: HTMLElement,
     dotClass: string,
     text: string,
-    dotTag: 'div' | 'span' = 'div',
+    dotTag: 'div' | 'span' = 'div'
   ): void {
     target.textContent = '';
     const dot = document.createElement(dotTag);
@@ -769,6 +826,13 @@ export class SSHTerminal {
     this.searchBox.style.display = 'none';
     this.searchVisible = false;
     this.terminal.focus();
+  }
+
+  /**
+   * 清除滚动历史缓冲区（Scrollback Buffer），使当前行为首行。
+   */
+  clearBuffer(): void {
+    this.terminal.clear();
   }
 
   // ==================== known_hosts (TOFU) ====================
@@ -944,6 +1008,10 @@ export class SSHTerminal {
     this.lastConfig = null;
     this.lastHostInfo = hostInfo ?? null;
     this.reconnectWebSocketFactory = options.reconnectFactory ?? null;
+    this.resumeOnlyMode = options.resumeOnly === true;
+    this.shareResumeDeadline = null;
+    this.shareResumeChallengeMissing = false;
+    this.sessionRequiresDeviceSig = false;
     this.canReconnect = Boolean(this.reconnectWebSocketFactory);
     this.sessionReady = false;
     this.ws = ws;
@@ -1024,6 +1092,41 @@ export class SSHTerminal {
             return;
           }
 
+          if (msg.type === 'session_created') {
+            this.activeSessionId = typeof msg.sessionId === 'string' ? msg.sessionId : null;
+            this.activeResumeToken = typeof msg.resumeToken === 'string' ? msg.resumeToken : null;
+            // 绑定状态由服务端判定；未绑定环境（resumeEnabled=false）不支持断线自动恢复
+            this.sessionRequiresDeviceSig = msg.deviceBound === true;
+            this.shareResumeSupported = msg.resumeEnabled !== false;
+          }
+
+          if (msg.type === 'session_resumed') {
+            // 服务端每次成功恢复都会轮换 resume token，旧 token 即刻失效
+            if (typeof msg.resumeToken === 'string' && msg.resumeToken) {
+              this.activeResumeToken = msg.resumeToken;
+            }
+            // 断线期间保留的 SFTP attach URL，用于恢复后重建 SFTP 数据通道
+            if (typeof msg.sftpAttachUrl === 'string' && msg.sftpAttachUrl) {
+              this.sftpAttachUrl = msg.sftpAttachUrl;
+            }
+            this.sessionReady = true;
+            this.reconnectAttempts = 0;
+            // 恢复成功：重置恢复窗口倒计时，下次断线获得完整预算
+            this.shareResumeDeadline = null;
+            this.shareResumeChallengeMissing = false;
+            this.terminal.writeln(`\x1b[32m[*] ${t('terminal.sessionResumed')}\x1b[0m`);
+            const termStatus = document.getElementById('term-status');
+            if (termStatus)
+              SSHTerminal.renderStatusDot(
+                termStatus,
+                'w-2 h-2 bg-[var(--color-primary)]',
+                t('terminal.connected')
+              );
+            this.onSessionReady?.();
+            this.startHeartbeat();
+            return;
+          }
+
           if (msg.type === 'agent_frame') {
             this.onAgentFrameHandler?.(msg);
             return;
@@ -1048,6 +1151,10 @@ export class SSHTerminal {
                 this.canReconnect = false;
                 this.clearReconnectTimeout();
                 this.authChallengeDialog?.dismiss();
+              }
+              if (msg.event === 'share_session_expired') {
+                // 服务端已按最长会话时长终结：后续恢复请求必然失败，直接进入终态
+                this.shareSessionEndedByServer = true;
               }
               this.terminal.writeln(
                 `\x1b[31m[!] ${localizedSSHMessage(msg.message, msg.event, msg.params)}\x1b[0m`
@@ -1119,6 +1226,12 @@ export class SSHTerminal {
       this.onSessionClosed?.(event, willReconnect);
       if (willReconnect) {
         this.scheduleReconnect();
+      } else if (this.resumeOnlyMode && event.code !== 1000 && !this.shareResumeSupported) {
+        // 无恢复资格（认领环境无法绑定设备身份）：明确告知而非静默掉线
+        this.terminal.writeln(`\x1b[31m[!] ${t('terminal.shareResumeUnsupported')}\x1b[0m`);
+      } else if (this.resumeOnlyMode && this.shareSessionEndedByServer) {
+        // 服务端已终结（到期/撤销）：给出终态而非静默掉线
+        this.terminal.writeln(`\x1b[31m[!] ${t('terminal.shareResumeEnded')}\x1b[0m`);
       }
     };
 
@@ -1474,7 +1587,7 @@ export class SSHTerminal {
   }
 
   private disposeConnectionDisposables(): void {
-    this.disposables.forEach((d) => d.dispose());
+    for (const d of this.disposables) d.dispose();
     this.disposables = [];
   }
 
@@ -1511,17 +1624,162 @@ export class SSHTerminal {
   }
 
   private hasReconnectStrategy(): boolean {
+    // 分享恢复模式：以凭据持有 + 宽限窗口预算为准，不受常规次数上限约束——
+    // 指数退避需能铺满服务端完整的断线保持期，给用户留出切换网络的时间。
+    if (this.resumeOnlyMode) {
+      return (
+        this.shareResumeSupported &&
+        Boolean(this.activeSessionId && this.activeResumeToken) &&
+        (this.shareResumeDeadline === null || Date.now() < this.shareResumeDeadline)
+      );
+    }
     return (
       this.canReconnect &&
       this.reconnectAttempts < this.maxReconnectAttempts &&
-      Boolean(this.lastConfig || this.reconnectWebSocketFactory)
+      Boolean(
+        this.lastConfig ||
+          this.reconnectWebSocketFactory ||
+          (this.activeSessionId && this.activeResumeToken)
+      )
     );
+  }
+
+  private async tryResumeSession(): Promise<boolean> {
+    if (!this.activeSessionId || !this.activeResumeToken) return false;
+    try {
+      const params = new URLSearchParams({
+        session: this.activeSessionId,
+        resume_token: this.activeResumeToken,
+        cols: String(this.terminal.cols),
+        rows: String(this.terminal.rows),
+      });
+      // 设备绑定挑战签名：浏览器不支持或密钥不可用时省略；
+      // 服务端仅对认领时绑定了公钥的分享会话强制校验。
+      const challenge = await createResumeChallengeParams(this.activeSessionId);
+      this.shareResumeChallengeMissing = !challenge && hasDeviceBindingSupport();
+      if (challenge) {
+        params.set('did_nonce', challenge.nonce);
+        params.set('did_ts', String(challenge.timestamp));
+        params.set('did_sig', challenge.signature);
+      }
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(
+        `${protocol}//${window.location.host}/api/ssh?${params.toString()}`
+      );
+      socket.binaryType = 'arraybuffer';
+      this.resetActiveConnection();
+      this.ws = socket;
+      this.setupWebSocketHandlers();
+      return true;
+    } catch {
+      this.activeSessionId = null;
+      this.activeResumeToken = null;
+      return false;
+    }
   }
 
   private scheduleReconnect(): void {
     this.clearReconnectTimeout();
 
     this.reconnectAttempts++;
+
+    // 分享会话（resume-only）：ticket 已一次性消费，完整重连不可能也不被允许，
+    // 仅允许秒级恢复，有限重试后宣告分享结束。
+    if (this.resumeOnlyMode) {
+      this.scheduleShareResume();
+      return;
+    }
+
+    // 首次重连时，如果持有断线保持凭据，优先进行 1-RTT 毫秒级无缝恢复；
+    // 恢复失败（含服务端拒绝）回退到常规指数退避完整重连。
+    if (this.reconnectAttempts === 1 && this.activeSessionId && this.activeResumeToken) {
+      this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
+      void this.tryResumeSession().then((resumed) => {
+        if (!resumed) this.scheduleFallbackReconnect();
+      });
+      return;
+    }
+
+    this.scheduleFallbackReconnect();
+  }
+
+  /** 分享会话的短间隔秒级恢复循环；超出尝试上限后输出终态并停止。 */
+  private scheduleShareResume(): void {
+    // 服务端已终结会话（如达到最长会话时长）：不再空转重试
+    if (this.shareSessionEndedByServer) {
+      this.finishShareResume();
+      return;
+    }
+    if (!this.hasReconnectStrategy()) {
+      this.finishShareResume();
+      return;
+    }
+    // 首次进入本断线周期时启动宽限窗口倒计时（对齐服务端 SESSION_GRACE_PERIOD_MS）
+    if (this.shareResumeDeadline === null) {
+      this.shareResumeDeadline = Date.now() + SHARE_RESUME_RETRY_WINDOW_MS;
+    }
+    const remainingMs = this.shareResumeDeadline - Date.now();
+    if (remainingMs <= RESUME_FINAL_ATTEMPT_MARGIN_MS) {
+      // 剩余不足以完成一次有意义的握手往返：直接进入终态，避免注定
+      // 撞上服务端过期的末次冲刺（此前会在窗口边缘发出必败请求）
+      this.finishShareResume();
+      return;
+    }
+    // 首次重试时提示设备验证材料缺失（服务端将拒绝无签名的恢复请求）
+    if (
+      this.reconnectAttempts === 1 &&
+      this.sessionRequiresDeviceSig &&
+      this.shareResumeChallengeMissing
+    ) {
+      this.terminal.writeln(`\x1b[33m[!] ${t('terminal.shareResumeNoDeviceIdentity')}\x1b[0m`);
+    }
+    // 第二次重试仍失败且验证材料正常：大概率是浏览器环境与认领时不一致
+    // （无痕模式重开、清除站点数据、更换浏览器/设备），给出友善原因提示
+    if (
+      this.reconnectAttempts === 2 &&
+      this.sessionRequiresDeviceSig &&
+      !this.shareResumeChallengeMissing
+    ) {
+      this.terminal.writeln(`\x1b[33m[!] ${t('terminal.shareResumeEnvironmentHint')}\x1b[0m`);
+    }
+    // 与常规重连一致的指数退避（首次 1s 起）；被窗口剩余时间截断时即为
+    // 末次尝试：实际等待缩短、明确告知用户，保证最后一次请求在服务端
+    // 保持期耗尽前发出
+    const backoffDelay = Math.min(1000 * 2 ** Math.max(0, this.reconnectAttempts - 1), 30000);
+    const isFinalAttempt = backoffDelay > remainingMs;
+    const delay = Math.min(backoffDelay, remainingMs);
+    const delaySeconds = Math.max(1, Math.round(delay / 1000));
+    if (isFinalAttempt) {
+      this.terminal.writeln(`\x1b[33m[*] ${t('terminal.shareResumeFinalAttempt')}\x1b[0m`);
+    }
+    this.terminal.writeln(
+      `\x1b[33m[*] ${t('terminal.resumingSession', { seconds: delaySeconds, attempt: this.reconnectAttempts })}\x1b[0m`
+    );
+
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectTimeout = null;
+      void this.tryResumeSession().then((resumed) => {
+        // 构造失败立即终态；构造成功后的失败由 onclose 驱动下一轮恢复
+        if (!resumed) this.finishShareResume();
+      });
+    }, delay);
+  }
+
+  /** 分享会话恢复彻底失败：清理凭据并输出终态提示。 */
+  private finishShareResume(): void {
+    this.resumeOnlyMode = false;
+    this.shareResumeDeadline = null;
+    this.shareResumeChallengeMissing = false;
+    this.sessionRequiresDeviceSig = false;
+    this.activeSessionId = null;
+    this.activeResumeToken = null;
+    this.terminal.writeln(`\x1b[31m[!] ${t('terminal.shareResumeEnded')}\x1b[0m`);
+  }
+
+  /** 常规指数退避重连：完整重建连接（lastConfig 或 factory）。 */
+  private scheduleFallbackReconnect(): void {
+    this.clearReconnectTimeout();
+
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
 
     this.terminal.writeln(
@@ -1534,7 +1792,7 @@ export class SSHTerminal {
         this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
         try {
           await this.connect(this.lastConfig, { resetDisplay: false });
-        } catch (e) {
+        } catch {
           this.terminal.writeln(`\x1b[31m[!] ${t('terminal.reconnectFailed')}\x1b[0m`);
         }
       } else if (this.reconnectWebSocketFactory) {
@@ -1571,6 +1829,12 @@ export class SSHTerminal {
     this.lastConfig = null;
     this.lastHostInfo = null;
     this.reconnectWebSocketFactory = null;
+    this.resumeOnlyMode = false;
+    this.shareResumeDeadline = null;
+    this.shareResumeChallengeMissing = false;
+    this.sessionRequiresDeviceSig = false;
+    this.activeSessionId = null;
+    this.activeResumeToken = null;
     this.resetTerminalDisplay();
   }
 
@@ -1601,7 +1865,7 @@ export class SSHTerminal {
     this.viewportRestoreFrame = null;
     this.imeTextarea = null;
     this.themeCleanup();
-    this.terminalDisposables.forEach((d) => d.dispose());
+    for (const d of this.terminalDisposables) d.dispose();
     this.terminalDisposables = [];
     this.terminal.dispose();
   }

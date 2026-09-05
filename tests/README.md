@@ -12,17 +12,26 @@ tests/
 ├── worker/                        # Worker 路由、安全、DNS、UserDB 与标签测试
 ├── agent-code-actions.test.ts # Agent 代码块复制/填入规则
 ├── agent-terminal-selection.test.ts # 终端选区附件和非授权安全边界
+├── api-errors.test.ts          # API 错误信息边界与状态码
 ├── auth-challenge-dialog.test.ts # RFC 4256 认证挑战对话框交互
 ├── clipboard.test.ts              # Clipboard API 与旧版复制回退
+├── editor-content.test.ts         # 在线编辑内容解码、BOM/换行符与嗅探
 ├── frontend-ux.test.ts            # 前端关键交互源码回归（标签栏/状态栏渲染等）
 ├── host-display.test.ts           # IPv4/IPv6 掩码与完整地址复制
 ├── i18n.test.ts                   # 中英文词条和语言解析
 ├── known-hosts.test.ts            # 已知主机指纹 TOFU 信任与变更流程
 ├── mobile-input.test.ts           # iOS IME diff 与一次性修饰键帮助函数
-├── share-session.test.ts          # 分享会话确认/领取幂等与页面状态
+├── sftp-dialogs.test.ts           # SFTP 新建/重命名/删除弹窗与名称校验
+├── sftp-helpers.test.ts           # SFTP 面包屑解析、多维排序与格式化
+├── sftp-panel.test.ts             # SFTP 面包屑与路径状态回归
 ├── sftp-selection.test.ts         # SFTP 单选、多选、连选和全选模型
+├── sftp-transfer.test.ts          # SFTP 传输控制器与异步原语
+├── share-session.test.ts          # 分享会话确认/领取幂等与页面状态
 ├── snippet-local-store.test.ts    # 匿名命令片段 localStorage 存储与限额
+├── snippet-manager.test.ts        # 命令片段搜索过滤与一键复制交互
 ├── snippet-schema.test.ts         # 片段名称/命令/数量校验与规范化
+├── snippet-variables.test.ts      # 命令片段 {{var}} 参数占位符提取与替换
+├── terminal-shortcuts.test.ts     # 终端快捷键（Cmd+F 搜索、Cmd+K 清屏）
 ├── terminal-status.test.ts        # SSH 状态事件翻译
 ├── terminal-text.test.ts          # 终端文本处理
 ├── theme.test.ts                  # 内置/自定义主题
@@ -55,6 +64,12 @@ pnpm run test:e2e
 pnpm run verify
 ```
 
+> **测试类型检查**：`pnpm run typecheck` 的 worker 阶段会依次执行
+> `tsc --noEmit`（src）、`tsc -p tests/tsconfig.worker.json`（tests/worker|ssh|build，
+> workers-types 环境）与 `tsc -p tests/tsconfig.frontend.json`（tests 根目录 *.test.ts + e2e，
+> DOM 环境）。两个测试配置分开的原因：`@cloudflare/workers-types` 声明的基础 DOM 接口
+> （如 Element.append）与 DOM lib 合并冲突，不能在同一项目里同时加载。
+
 ## 当前覆盖范围
 
 ### SSH 协议
@@ -77,22 +92,27 @@ pnpm run verify
 
 ### 前端与构建
 
-- 服务器搜索、标签筛选和响应式分页（桌面 9 / 平板 6 / 移动 3）
+- 服务器搜索、标签筛选、配置一键克隆（Duplicate Server）和响应式分页（桌面 9 / 平板 6 / 移动 3）
+- 终端多标签：双击内联重命名（空值还原）、右键上下文菜单（重命名/克隆会话/关闭其他/关闭）与 document click 防泄漏
+- 终端快捷键适配：macOS `Cmd+F` 搜索、`Cmd+K` / `Ctrl+Shift+K` 清屏且不干扰 Shell 原生 `Ctrl+K`
+- 命令片段库：实时模糊搜索、一键复制到剪贴板与 `{{var}}` 动态参数占位符弹窗录入
+- SFTP 生产力：路径面包屑分级导航、表头多维排序（文件名/大小/时间）、新建 0 字节文件与 CodeMirror 在线编辑联动
 - SFTP 单选、Cmd/Ctrl 多选、Shift 连选和全选
-- Agent 终端选区附件、问题组合和非授权安全边界
+- Agent 终端选区附件、问题组合、快捷诊断 Prompt 气泡（Chips）和非授权安全边界
 - 终端选区自动复制、指针取消和旧版复制回退
-- i18n、主题、终端状态/文本、已知主机与片段本地存储
+- i18n、Theme V3 主题（背景/效果/版式钳制、对比度与 schema）、终端状态/文本、已知主机与片段本地存储
 - 构建可复现性、xterm 生产构建兼容和原生弹窗禁用
 
 ### 浏览器 E2E
 
 - 匿名连接表单 axe 检查
 - 服务器弹窗的基本对话框语义、初始焦点和 Escape 关闭
-- 服务器标签筛选与分页
-- Agent 终端选区附件
+- 服务器标签筛选、分页与配置快速克隆
+- 多标签操作：双击内联重命名、空值与失焦恢复、右键菜单项与外部点击关闭
+- Agent 终端选区附件与快捷诊断 Prompt 气泡点击填入
 - 终端选区复制与焦点恢复
 - 认证挑战对话框、iOS 输入法、移动端后台连接恢复与分享会话领取
-- SFTP 覆盖确认、主题样式与 UI 回归
+- SFTP 覆盖确认、路径面包屑、表头排序、新建文件、主题样式与 UI 回归
 
 ## 当前限制
 

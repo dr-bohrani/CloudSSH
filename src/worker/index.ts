@@ -280,6 +280,13 @@ export default {
           });
         }
 
+        // Check for resume-token (session re-attach)
+        const resumeToken = url.searchParams.get('resume_token');
+        const resumeSession = url.searchParams.get('session');
+        if (resumeToken && resumeSession) {
+          return handleResumeSSHConnection(request, env, resumeSession, resumeToken);
+        }
+
         // Check for one-time-token (from server management connect)
         const connectToken = url.searchParams.get('token');
         if (connectToken) {
@@ -406,14 +413,24 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
       );
     }
     if (request.method === 'POST') {
-      const body = await request.json<{ expiresInMinutes?: number; maxSessionMinutes?: number }>();
+      const body = await request.json<{
+        expiresInMinutes?: number;
+        maxSessionMinutes?: number;
+        auditRetentionDays?: number;
+      }>();
       const expiresInMinutes = Number(body.expiresInMinutes);
       const maxSessionMinutes = Number(body.maxSessionMinutes);
+      // 审计保留天数：缺省 90；白名单与前端选项一致
+      const auditRetentionDays =
+        body.auditRetentionDays === undefined ? 90 : Number(body.auditRetentionDays);
       if (![5, 15, 30, 60].includes(expiresInMinutes)) {
         return Response.json({ error: 'Invalid share expiry' }, { status: 400 });
       }
       if (![15, 30, 60, 120].includes(maxSessionMinutes)) {
         return Response.json({ error: 'Invalid maximum session duration' }, { status: 400 });
+      }
+      if (![7, 30, 90, 180, 365].includes(auditRetentionDays)) {
+        return Response.json({ error: 'Invalid audit retention' }, { status: 400 });
       }
 
       const token = createShareToken();
@@ -454,6 +471,7 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
             serverName: metadata.serverName,
             expiresAt,
             maxSessionSeconds: maxSessionMinutes * 60,
+            auditRetentionDays,
           }),
         })
       );
@@ -648,7 +666,9 @@ async function handleSnippetsRoute(request: Request, url: URL, env: Env): Promis
   }
   const stub = getUserDBStub(env, user.github_id);
   if (url.pathname === '/api/snippets' && request.method === 'GET') {
-    return stub.fetch(new Request(`http://internal/internal/snippets?user_id=${user.id}`, { method: 'GET' }));
+    return stub.fetch(
+      new Request(`http://internal/internal/snippets?user_id=${user.id}`, { method: 'GET' })
+    );
   }
   if (url.pathname === '/api/snippets' && request.method === 'POST') {
     let body: Record<string, unknown>;
@@ -658,7 +678,13 @@ async function handleSnippetsRoute(request: Request, url: URL, env: Env): Promis
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
     body.user_id = user.id;
-    return stub.fetch(new Request('http://internal/internal/snippets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+    return stub.fetch(
+      new Request('http://internal/internal/snippets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    );
   }
   const snippetMatch = url.pathname.match(/^\/api\/snippets\/(\d+)$/);
   if (snippetMatch) {
@@ -671,10 +697,22 @@ async function handleSnippetsRoute(request: Request, url: URL, env: Env): Promis
         return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
       }
       body.user_id = user.id;
-      return stub.fetch(new Request(`http://internal/internal/snippets/${snippetId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+      return stub.fetch(
+        new Request(`http://internal/internal/snippets/${snippetId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
     }
     if (request.method === 'DELETE') {
-      return stub.fetch(new Request(`http://internal/internal/snippets/${snippetId}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: user.id }) }));
+      return stub.fetch(
+        new Request(`http://internal/internal/snippets/${snippetId}`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: user.id }),
+        })
+      );
     }
   }
   return Response.json({ error: 'Not Found' }, { status: 404 });
@@ -837,7 +875,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
     return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
   }
 
-  const sessionName = `session:${Date.now()}:${Math.random()}`;
+  const sessionName = `session:${Date.now()}:${crypto.randomUUID()}`;
   const doId = env.SSH_SESSION.idFromName(sessionName);
   // 匿名路径不做自动推断（Worker 在 upgrade 时拿不到 host）；
   // 仅尊重用户通过前端下拉手动传入的 ?region= 覆盖值
@@ -857,6 +895,44 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
 
+/**
+ * 处理会话秒级断线重连 (Session Re-attach)
+ * 流程：通过 sessionName 路由至原 DO 实例，并附带 resumeToken 鉴权
+ */
+async function handleResumeSSHConnection(
+  request: Request,
+  env: Env,
+  sessionName: string,
+  resumeToken: string
+): Promise<Response> {
+  const url = parseRequestUrl(request.url);
+  if (!url) return Response.json({ error: 'Invalid request URL' }, { status: 400 });
+
+  if (!hasSameWebSocketOrigin(request, url)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+
+  // 与 direct / one-time-token 升级路径保持一致的强制 GitHub 登录门禁：
+  // REQUIRE_GITHUB_AUTH=true 时 resume 凭据不能替代有效会话。
+  if (isGitHubAuthRequired(env) && !(await getAuthenticatedUser(request, env))) {
+    return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
+  }
+
+  const doId = env.SSH_SESSION.idFromName(sessionName);
+  const stub = env.SSH_SESSION.get(doId);
+
+  const doUrl = parseRequestUrl(request.url);
+  if (!doUrl) return Response.json({ error: 'Invalid request URL' }, { status: 400 });
+  doUrl.searchParams.set('session', sessionName);
+  doUrl.searchParams.set('resume_token', resumeToken);
+
+  const headers = new Headers(request.headers);
+  headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
+  headers.delete('x-ssh-config');
+
+  return stub.fetch(new Request(doUrl.toString(), { headers }));
+}
+
 async function handleShareClaim(request: Request, url: URL, env: Env): Promise<Response> {
   if (!isSSHSharingEnabled(env)) {
     return Response.json({ error: 'SSH sharing is disabled' }, { status: 404 });
@@ -868,14 +944,21 @@ async function handleShareClaim(request: Request, url: URL, env: Env): Promise<R
       headers: { 'Retry-After': String(retryAfter) },
     });
   }
-  let body: { token?: string };
+  let body: { token?: string; devicePubKey?: string };
   try {
-    body = await request.json<{ token?: string }>();
+    body = await request.json<{ token?: string; devicePubKey?: string }>();
   } catch {
     return Response.json({ error: 'Invalid request body' }, { status: 400 });
   }
   if (typeof body.token !== 'string' || !/^[A-Za-z0-9_-]{40,128}$/.test(body.token)) {
     return Response.json({ error: 'Invalid share link' }, { status: 400 });
+  }
+  // 可选的设备绑定公钥（SPKI base64url）；格式非法时直接拒绝，避免静默降级。
+  if (
+    body.devicePubKey !== undefined &&
+    (typeof body.devicePubKey !== 'string' || !/^[A-Za-z0-9_-]{80,600}$/.test(body.devicePubKey))
+  ) {
+    return Response.json({ error: 'Invalid device public key' }, { status: 400 });
   }
   const shareRef = await hashShareToken(body.token);
   const shareStub = env.SSH_SHARE.get(env.SSH_SHARE.idFromName(shareRef));
@@ -883,7 +966,7 @@ async function handleShareClaim(request: Request, url: URL, env: Env): Promise<R
     new Request('http://internal/internal/claim', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: body.token }),
+      body: JSON.stringify({ token: body.token, devicePubKey: body.devicePubKey }),
     })
   );
   if (!claimResponse.ok) return claimResponse;
@@ -929,6 +1012,15 @@ async function handleShareOwnerRoute(request: Request, url: URL, env: Env): Prom
       )
     );
   }
+  if (url.pathname.endsWith('/audit') && request.method === 'DELETE') {
+    return shareStub.fetch(
+      new Request('http://internal/internal/audit/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerUserId: user.id }),
+      })
+    );
+  }
   if (!url.pathname.endsWith('/audit') && request.method === 'DELETE') {
     return shareStub.fetch(new Request('http://internal/internal/revoke', { method: 'POST' }));
   }
@@ -964,9 +1056,10 @@ async function handleShareSSHConnection(
     })
   );
   if (!configResponse.ok) return configResponse;
-  const { config } = await configResponse.json<{
+  const { config, devicePubKey } = await configResponse.json<{
     config: SSHConnectionConfig;
     serverName: string;
+    devicePubKey?: string | null;
   }>();
   if (!config.sessionPolicy || config.sessionPolicy.shareRef !== shareRef) {
     return Response.json({ error: 'Invalid share session policy' }, { status: 500 });
@@ -988,6 +1081,11 @@ async function handleShareSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
+  // 认领时绑定的设备公钥由服务端链路下发（claim → ShareDO → consume），
+  // 客户端无法注入或替换，断线恢复时以此验签。
+  if (typeof devicePubKey === 'string' && devicePubKey) {
+    headers.set('x-share-device-key', devicePubKey);
+  }
   return sessionStub.fetch(new Request(doUrl.toString(), { headers }));
 }
 
@@ -1048,7 +1146,7 @@ async function handleTokenSSHConnection(
     );
   }
 
-  const sessionName = `session:${Date.now()}:${Math.random()}`;
+  const sessionName = `session:${Date.now()}:${crypto.randomUUID()}`;
   const doId = env.SSH_SESSION.idFromName(sessionName);
   // Token 路径：locationHint 由 user-db.handleConnectServer 按最外层直连节点计算并写入 config
   // （优先级：入口服务器手动 region → 入口 DB 持久化 inferred_hint → undefined）

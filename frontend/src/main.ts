@@ -90,6 +90,23 @@ function getTabManager(): TabManager {
     tabManager.setTabsChangedHandler(() => {
       syncConnectionBackButtons();
     });
+    // 右键标签页克隆会话
+    tabManager.setDuplicateTabHandler(async (tab) => {
+      const serverId = tab.hostInfo?.serverId;
+      if (!serverId) {
+        notify(t('terminal.duplicateAnonymousUnsupported'), { variant: 'warning' });
+        return;
+      }
+      try {
+        const ws = await requestSavedServerWebSocket(serverId);
+        const { terminal } = showTerminalWithNewTab(tab.label, tab.hostInfo);
+        terminal.mount();
+        const reconnectFactory = () => requestSavedServerWebSocket(serverId);
+        terminal.connectWithWebSocket(ws, tab.hostInfo, { reconnectFactory });
+      } catch (e) {
+        notify(e instanceof Error ? e.message : String(e), { variant: 'danger' });
+      }
+    });
 
     // 绑定 new-tab-btn
     bindNewTabButton();
@@ -178,7 +195,7 @@ function initTerminalTab(): void {
   const wsUrl = params.get('wsUrl')!;
   const serverName = params.get('name') || 'Server';
   const host = params.get('host') || '';
-  const port = parseInt(params.get('port') || '0') || 0;
+  const port = parseInt(params.get('port') || '0', 10) || 0;
 
   if (!validateWsUrl(wsUrl)) {
     const errorDiv = document.createElement('div');
@@ -369,7 +386,9 @@ function showSharedTerminal(claim: ClaimedShare): void {
   terminal.mount();
   const socket = new WebSocket(claim.wsUrl);
   socket.binaryType = 'arraybuffer';
-  terminal.connectWithWebSocket(socket);
+  // 分享会话：仅允许秒级恢复（ticket 已一次性消费，完整重连不可能），
+  // 恢复彻底失败时在终端内宣告分享结束。
+  terminal.connectWithWebSocket(socket, undefined, { resumeOnly: true });
 }
 
 async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket> {
@@ -407,12 +426,12 @@ document.getElementById('disconnect-btn')?.addEventListener('click', () => {
 
 // ==================== 命令片段库 ====================
 
-function openSnippetManager(): void {
-  void snippetManager.open();
+function toggleSnippetManager(): void {
+  snippetManager.toggle();
 }
 
-document.getElementById('snippet-toggle-btn')?.addEventListener('click', openSnippetManager);
-document.getElementById('mobile-snippets-btn')?.addEventListener('click', openSnippetManager);
+document.getElementById('snippet-toggle-btn')?.addEventListener('click', toggleSnippetManager);
+document.getElementById('mobile-snippets-btn')?.addEventListener('click', toggleSnippetManager);
 
 // ==================== SFTP 面板 ====================
 
@@ -563,6 +582,14 @@ importThemeInput?.addEventListener('change', (e) => {
 function restoreTheme(): void {
   const selection = localStorage.getItem('cloudssh_theme_selection');
   localStorage.removeItem('cloudssh_theme');
+
+  // glacier 内置主题已被 Apple 主题取代：旧选择一次性迁移到同为深色的 Standard Dark
+  if (selection === 'glacier') {
+    localStorage.setItem('cloudssh_theme_selection', 'standard-dark');
+    applyBuiltInTheme('standard-dark');
+    syncThemeSelectors('standard-dark');
+    return;
+  }
 
   if (isBuiltInTheme(selection)) {
     applyBuiltInTheme(selection);
