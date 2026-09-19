@@ -78,7 +78,17 @@ export interface AgentState {
 
 export interface AgentFrame {
   type: 'agent_frame';
-  subType: 'thinking' | 'executing' | 'response' | 'error' | 'confirm_required';
+  subType:
+    | 'thinking'
+    | 'executing'
+    | 'response'
+    | 'error'
+    | 'confirm_required'
+    | 'stream_chunk'
+    | 'stream_end'
+    | 'progress_extend'
+    | 'memory_updated'
+    | 'reset_done';
   [key: string]: unknown;
 }
 
@@ -86,4 +96,30 @@ export interface AIConfig {
   base_url: string;
   model: string;
   api_key: string;
+}
+
+import type {
+  KnowledgeAction,
+  KnowledgeCategory,
+  ServerKnowledgeItem,
+  ServerWorkLog,
+  UnifiedServerMemory,
+  WorkLogMode,
+} from '../../server-memory-schema';
+
+export type {
+  ServerWorkLog,
+  ServerKnowledgeItem,
+  UnifiedServerMemory,
+  KnowledgeCategory,
+  WorkLogMode,
+  KnowledgeAction,
+};
+
+export interface AgentMemoryProvider {
+  fetchUnifiedMemory(): Promise<UnifiedServerMemory>;
+  saveBatchMemory(batch: {
+    workLog?: { mode?: WorkLogMode; title: string; summary: string };
+    knowledge?: Array<{ action?: KnowledgeAction; category?: KnowledgeCategory; key: string; value?: string }>;
+  }): Promise<void>;
 }
