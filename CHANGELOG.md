@@ -5,6 +5,125 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-09-24
+
+### Added
+
+- **单管理员密码登录模式（与 GitHub OAuth 互斥，密码优先）**：
+  - 新增单一环境变量 `ADMIN_PASSWORD_HASH`（非空即启用密码模式）：全实例仅本地管理员一个账号，服务器管理、SFTP、AI Agent、一次性分享、主题/片段/AI 配置等功能与 GitHub 登录完全对等；置空或删除即刻退回 GitHub 模式，两侧配置与数据零影响；
+  - 浏览器内哈希生成器（密码不出浏览器、不绑定设备，任意设备可登录）：匿名实例认证页脚入口、全模式 `#password-setup` 直路由与坏哈希面板重新生成三处入口；另提供 `pnpm run hash-password` 本地 CLI 生成脚本；
+  - 登录链路采用客户端 PBKDF2 预拉伸（server relief），Worker 侧仅做 SHA-256 恒时比对，兼容 Workers Free 套餐 10ms CPU 限制；
+  - 防爆破三道防线：同源 Origin 校验（防跨站登录 CSRF）、Turnstile（已配置时必验）、哨兵 DO 持久化指数退避节流（5 次连败起步、封顶 15 分钟、跨 isolate 权威）；
+  - 会话令牌内嵌密码代际指纹（`-1:<fp8>:<random>`）：更换哈希即刻吊销全部旧会话；双向模式门拒绝跨模式残留会话与一次性令牌；
+  - 哈希非空但格式损坏时 fail closed（登录 500 + 前端错误面板），绝不静默回退；
+  - 密码登录与哈希生成器 UI 完成移动端适配（对话框近全屏 + 安全区、44px 触摸目标、页脚入口独占整行、iOS 聚焦防缩放）。
+- **一次性 SSH 分享随部署默认启用**：`wrangler.toml` `[vars]` 置 `ENABLE_SSH_SHARING = "true"`，Git 集成/CLI 部署开箱即用（关闭改为 `false`；Dashboard 手动上传部署不受影响）。
+
+### Changed
+
+- **部署默认变量完善**：`IDLE_TIMEOUT`（`"30m"`）、`REQUIRE_GITHUB_AUTH`（`"false"`）、`STRICT_HOST_KEY_VERIFY`（`"true"`）随 `wrangler.toml` `[vars]` 默认下发，与代码默认完全一致（配置权威归位配置文件）；test 环境 `REQUIRE_GITHUB_AUTH` 默认 `"true"`，用于端到端验证强制登录链路；
+- `REQUIRE_GITHUB_AUTH` 语义泛化为「要求登录」：GitHub 或单管理员密码会话均满足，变量名保留兼容；
+- **CF 隧道连接表单移除端口字段**：隧道模式隐藏端口输入（域名输入占满整行）、服务器卡片仅展示域名——连接只看域名，实际 SSH 端口由内网 cloudflared 配置决定，端口仅作存储记录（缺省回落 22）；
+- 密码生成器入口改为模式感知：仅匿名模式显示页脚入口（GitHub/密码模式隐藏，既有实例升级后界面零变化），切换与轮换经 `#password-setup` 直路由（消费后清地址栏，兼容同页 hash 导航）。
+
+### Fixed
+
+- **云端自定义主题槽被陈旧导入污染且无法清除**：
+  - `restoreCloudTheme` 回填收紧：仅当本地选择停留在自定义主题（`__custom__`）时才向账号同步，杜绝浏览器残留导入污染全新账号（如密码模式新建管理员）的云端主题槽；
+  - 新增 `DELETE /api/user/theme` 幂等端点：登录态切换到内置主题 = 明确放弃自定义槽，同步清除本地缓存、选择器自定义项（含液态分段控制条）与云端记录，杜绝跨设备复现；导入文件仍为自定义主题唯一写入路径；
+  - 契约测试同步演进并新增主题槽生命周期用例（7 项）。
+
+## [2.4.4] - 2026-09-22
+
+### Added
+
+- **繁体中文（台灣 / Traditional Chinese）全链路支持 (#147)**：
+  - 前端新增完整 `zh-TW` 本地化词典，全面覆盖认证、服务器列表、标签页管理、终端交互、状态栏、快捷键、SFTP 文件管理器、在线编辑、命令片段库、AI Agent 面板与分享会话；
+  - 顶栏语言切换器升级为三语循环切换（`zh-CN` -> `zh-TW` -> `en-US` -> `zh-CN`），支持通过 URL 参数（`?lang=zh-TW`）或本地存储（`cloudssh_locale`）持久化偏好；
+  - [GitHub Pages 主题在线编辑器](https://newbietan.github.io/CloudSSH/)同步补齐完整的 `zh-TW` 词典与三语切换支持；
+  - 统一服务器记忆模块（`server-memory-schema`）支持 `MemoryLocale`（`zh-TW`），日期与星期使用台湾惯用格式（如 `週一`、`3 天前`）；
+  - 感谢 @tbdavid2019 对繁体中文界面及词典的贡献。
+
+### Fixed
+
+- **港澳繁中语系解析兼容（`zh-HK` / `zh-MO`）**：
+  - 完善 `normalizeLocale` 逻辑，支持自动将 `zh-HK`（香港繁中）、`zh-MO`（澳门繁中）及其衍生变体规范化映射至 `zh-TW`，避免港澳浏览器环境误回退为简体中文；
+  - 增强下划线容错处理（`replaceAll('_', '-')`），支持 `zh_Hant_TW` 等多段标签。
+- **台湾 IT 惯用词校正与机翻痕迹消除**：
+  - 修复 `terminal.resumeStale` 错词，由「正在重新增立」校正为「正在重新建立」；
+  - 修复 SFTP 文件删除确认标题与消息中的生硬表述（「刪除專案」校正为「刪除項目」）；
+  - 统一剪贴板读取/写入与 SFTP 权限列中的「許可權」为标准「權限」；
+  - 优化 Agent 错误排查词条，将「報錯」调整为更地道的「錯誤訊息」；
+  - 修复主题编辑器预览表格表头中的「專案」为「項目」。
+- **AI Agent 核心循环繁中状态同步与前端记忆面板直通**：
+  - 修复前端 `agent-panel.ts` 渲染记忆面板时将 `zh-TW` 错误截断降级为 `zh-CN` 的缺陷，确保繁体相对日期与时间基准原样生效；
+  - 补全 `AgentCore` 内部循环对 `zh-TW` 语言环境的状态提示语、Token 限制续跑占位符、用户手动停止通知、执行超时提示与任务完成兜底文本；
+  - 完善中断运维会话的日志合成逻辑，确保繁体环境自动打上 `[已中斷]` 前缀与繁中摘要，且防重叠检查同时覆盖 `[已中斷]` 与 `[已中断]`；
+  - 扩充 Agent 记忆提炼熔断正则 `TRIVIAL_GREETING_PATTERN`，支持复合问候及繁体常用词（`早安`、`在嗎`、`哈囉` 等），并补充 `KNOWLEDGE_KEYWORD_PATTERN` 对 `連接埠`、`金鑰`、`記住`、`憑據` 的识别，提炼上下文标题全面支持繁中本地化。
+
+## [2.4.3] - 2026-09-22
+
+### Fixed
+
+- **Cloudflare 隧道出站重定向跟随缺陷（凭据外带风险 + 诊断失效）**：
+  - 隧道出站握手 `fetch` 显式声明 `redirect: 'manual'`：默认的 `follow` 会把 Zero Trust 的 302 重定向跟随到登录页，使已实现的 3xx 诊断分支永不生效（用户只能看到“未能升级为 WebSocket (HTTP 200 OK)”），同时会把 `CF-Access-Client-Secret` 原样转发到重定向目标；现与 `src/worker/index.ts`、`agent/core.ts` 等出站请求的既有口径对齐；
+  - 克隆服务器表单在克隆模式隐藏「清除已存密钥」按钮，避免与「克隆需重新输入 Client Secret」占位提示互相冲突（克隆体本无已存密钥可清除）；
+  - 补充「仅配置 Client ID」用例锁定凭据头各自独立发送的行为，并在既有出站用例中锁定 `redirect: 'manual'`。
+- **标签栏右侧无效纵向滚动条**：
+  - `#tab-bar` 使用 `overflow-x-auto` 时 CSS 会把 `overflow-y` 隐式提升为 `auto`，而标签项上下各 3px margin 的 margin-box（36px）比 36px 高度减去 1px 下边框后的可用高度多出 1px，Chrome 因此在标签栏右端绘制一条无意义的纵向滚动条；
+  - 修复：标签栏显式声明 `overflow-y-hidden`，仅保留横向滚动能力；实测 `scrollHeight` 由 36 收敛回 35，标签项与 active 强调线均不被裁切；
+  - 新增回归用例锁定 `overflow-y: hidden`、纵向无可滚动溢出且横向滚动未被一并关闭。
+
+### Changed
+
+- `AGENTS.md` #37 / #38 补充两条约束文档：抽屉收起（`closeAllDrawers()`）会按既有语义中断在途 SFTP 传输；隧道出站握手必须保持 `redirect: 'manual'`。
+
+## [2.4.2] - 2026-09-21
+
+### Fixed
+
+- **Cloudflare 隧道出站握手协议头补齐与 Zero Trust 诊断增强 (#143)**：
+  - 补齐 RFC 6455 规范出站 WebSocket 必须携带的 `Connection: Upgrade` 与 `Sec-WebSocket-Version: 13` 请求头，修复穿越 Cloudflare Zero Trust 边缘网关时因缺少 `Connection` 头被判定为普通 HTTP GET 请求而导致 403 拦截的缺陷；
+  - 细化 Zero Trust 401/403/302 拦截时的错误提示，自动提取响应头中的 `CF-RAY` 追踪 ID，并在错误信息中精准区分“未配置或缺少 Service Token”与“已携带 Service Token 但鉴权被拒”场景，指引用户检查 Access 策略并对齐审计日志；
+  - 前端 Service Token Secret 读取追加首尾空格清理（`.trim()`），防止控制台复制引入不可见换行符；
+  - 优化克隆服务器体验，针对 Service Token Secret 提供重新录入提示与占位说明，避免因未显式继承导致凭据缺失；
+  - 补充隧道协议头出站断言与 CF-RAY 错误回显测试用例。
+
+## [2.4.1] - 2026-09-21
+
+### Fixed
+
+- **新建连接与多标签切换时主动收起 AI Agent 与侧边抽屉**：
+  - 修复用户在使用 AI Agent 过程中点击标签栏「+」（新建连接）切换到服务器列表或连接页时，AI Agent 窗口未主动收起并覆盖在服务器列表上方的 UI 缺陷；
+  - `TabManager` 新增 `closeAllDrawers()` 方法，统一收起所有标签页的 AI Agent 抽屉与 SFTP 文件管理面板，并同步清理 `document.body` 上的 `agent-panel-open` 类名；
+  - `main.ts` 实现全局抽屉收起函数 `closeAllDrawers()`，在进入连接页（`showConnectionPage`）、退出终端视图（`deactivateTerminalView`）以及新开标签页（`showTerminalWithNewTab`）时主动收起全部抽屉，并将顶栏液态分段抽屉切换器（`LiquidSegmentedDrawerControl`）复位为未激活状态；
+  - 切换终端标签页时联动关闭全局命令片段（Snippet）抽屉，消除跨会话残留；
+  - 补充源码级断言与端到端回归用例，确保页面导航与抽屉状态机收敛。
+
+## [2.4.0] - 2026-09-20
+
+### Added
+
+- **Cloudflare 隧道（Zero Trust Tunnel）原生直连支持**：
+  - 支持通过 Cloudflare Tunnel（`cloudflared`）穿透内网直接连接无公网 IP、无开放端口的私有服务器（HomeLab、内网主机等），无需设置端口映射或跳板机；
+  - 底层基于 Cloudflare Tunnel 官方标准 WebSocket Carrier 机制传输原始 SSH 二进制字节流；新增 `src/worker/tunnel-stream.ts`（`TunnelWebSocketStream`）将出站 WebSocket 连接封装为标准 WHATWG 可读与可写双工流，与 CloudSSH 自研纯 TypeScript SSH-2.0 协议栈（TOFU 主机密钥校验、密码/私钥认证、Shell 交互、SFTP 图形化管理、在线编辑、AI Agent 控制循环）全量无感知复用；
+  - 支持可选的 Cloudflare Zero Trust Access Service Token（Client ID / Client Secret）鉴权，并通过 AES-GCM 行级加密持久化，API 响应严格脱敏（仅暴露 `has_cf_access_client_secret` 状态），连接令牌签发时安全解密流转；
+  - 针对 Zero Trust 访问拦截（401 / 403 / 302 重定向）提供精准的 Service Token 配置引导与错误提示。
+- **开放隧道模式手动指定 DO 区域偏好（Location Hint）**：
+  - 隧道模式下支持手动选择连接区域（Region），用户可显式指定与内网主机物理位置最近的 Cloudflare 数据中心区域（如 `apac`），促使 Durable Object 就近实例化，彻底消除因客户端接入点跨洋分流引发的三角路由延迟（实测端到端延迟降低 60% 以上）；
+  - 隧道服务器在卡片上展示专属 `CF 隧道` 徽标、域名快速复制与区域调度状态标签（`[cloud] 亚太地区 [手动]` / `[cloud] 自动 [自动]`）。
+- **Zero Trust 凭据生命周期与清除交互**：
+  - 编辑已存服务器时，针对已配置的 Service Token Secret 提供「清除已存密钥」一键交互，支持用户在 Zero Trust 移除访问策略后一键将后端密文重置清空，杜绝残留脏数据。
+
+### Fixed / Changed
+
+- **隧道域名轻量格式校验与输入防御**：
+  - 双端封装并复用 `isValidTunnelHostname` 纯函数，确保输入的隧道主机名为合法的标准公开域名（FQDN），在保存与连接阶段前置拦截纯 IP 字面量、单级主机名（如 `localhost`）及非法格式字符；
+  - 完善 `TunnelWebSocketStream` 资源释放生命周期，在流关闭时显式解绑底层全部 WebSocket 事件监听器；
+  - 修复 `toSSHMPInt` 随机测试在首字节恰为 `0x00` 时长度断言偶发抖动的 CI 缺陷。
+- **用户体验与端口引导优化**：
+  - 在添加/编辑服务器对话框中，隧道模式下为端口输入框增加清晰的内网映射辅助提示，避免用户对 22 与 443 端口产生理解歧义。
+
 ## [2.3.2] - 2026-09-19
 
 ### Fixed / Changed

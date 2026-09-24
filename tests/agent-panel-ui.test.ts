@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { enUS } from '../frontend/src/i18n/locales/en-US';
 import { zhCN } from '../frontend/src/i18n/locales/zh-CN';
+import { zhTW } from '../frontend/src/i18n/locales/zh-TW';
 
 describe('Agent 面板控制与交互增强 (静态与词条校验)', () => {
   const panelSource = readFileSync(
@@ -62,7 +63,7 @@ describe('Agent 面板控制与交互增强 (静态与词条校验)', () => {
     expect(panelSource).toContain('this.streamingEl.remove()');
   });
 
-  it('所有相关国际化词条在中英文语言包中均完整对齐', () => {
+  it('所有相关国际化词条在各语言包中均完整对齐', () => {
     const requiredKeys = [
       'agent.stop',
       'agent.stopped',
@@ -78,7 +79,53 @@ describe('Agent 面板控制与交互增强 (静态与词条校验)', () => {
 
     for (const key of requiredKeys) {
       expect(zhCN[key as keyof typeof zhCN], `Missing zh-CN key: ${key}`).toBeDefined();
+      expect(zhTW[key as keyof typeof zhTW], `Missing zh-TW key: ${key}`).toBeDefined();
       expect(enUS[key as keyof typeof enUS], `Missing en-US key: ${key}`).toBeDefined();
     }
+  });
+});
+
+describe('页面切换与多会话抽屉自动收起', () => {
+  const mainSource = readFileSync(new URL('../frontend/src/main.ts', import.meta.url), 'utf8');
+  const tabManagerSource = readFileSync(
+    new URL('../frontend/src/tab-manager.ts', import.meta.url),
+    'utf8'
+  );
+
+  it('TabManager 提供 closeAllDrawers 方法收起所有标签的 Agent 与 SFTP 面板', () => {
+    expect(tabManagerSource).toContain('closeAllDrawers(): void');
+    expect(tabManagerSource).toContain('tab.agentPanel?.hide()');
+    expect(tabManagerSource).toContain('tab.sftpPanel?.hide()');
+    expect(tabManagerSource).toContain("document.body.classList.remove('agent-panel-open')");
+  });
+
+  it('切换到连接页面或退出终端视图时主动收起全部抽屉并重置分段条', () => {
+    expect(mainSource).toContain('function closeAllDrawers(): void');
+    expect(mainSource).toContain('tabManager?.closeAllDrawers()');
+    expect(mainSource).toContain('snippetManager.close()');
+    expect(mainSource).toContain('syncDrawerSegmentedControl()');
+
+    // showConnectionPage / deactivateTerminalView 必须调用 closeAllDrawers
+    const showConnectionPageCode = mainSource.slice(
+      mainSource.indexOf('function showConnectionPage()'),
+      mainSource.indexOf('function showOfflineUI()')
+    );
+    expect(showConnectionPageCode).toContain('closeAllDrawers()');
+
+    const deactivateTerminalViewCode = mainSource.slice(
+      mainSource.indexOf('function deactivateTerminalView()'),
+      mainSource.indexOf('function showAuthSection()')
+    );
+    expect(deactivateTerminalViewCode).toContain('closeAllDrawers()');
+  });
+
+  it('新开标签页与活动标签切换时也确保抽屉状态重置与收起', () => {
+    const showTerminalWithNewTabCode = mainSource.slice(
+      mainSource.indexOf('function showTerminalWithNewTab('),
+      mainSource.indexOf('function showTerminalFromServer(')
+    );
+    expect(showTerminalWithNewTabCode).toContain('closeAllDrawers()');
+
+    expect(mainSource).toContain("document.addEventListener('cloudssh:active-terminal-change'");
   });
 });
