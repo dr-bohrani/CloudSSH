@@ -70,17 +70,17 @@ export class AgentCore {
     private sendToFrontend: (msg: any) => void,
     private fetchAIConfig: (userId: string) => Promise<AIConfig | null>,
     execCommand: (command: string, timeout: number, signal?: AbortSignal) => Promise<ExecResult>,
-    askConfirmation: (command: string, reason: string) => Promise<boolean>,
+    askConfirmation: (command: string, reason: string, signal?: AbortSignal) => Promise<boolean>,
     config?: Partial<AgentConfig>,
     private memoryProvider?: AgentMemoryProvider,
     private waitUntil?: (promise: Promise<unknown>) => void
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.toolExecutor = new ToolExecutor(this.terminalContext, execCommand,
-      async (command, reason) => {
+      async (command, reason, signal) => {
         const controller = this.abortController;
         this.pauseTimeout();
-        try { return await askConfirmation(command, reason); }
+        try { return await askConfirmation(command, reason, signal); }
         finally { this.resetTimeout(controller); }
       }, () => this.resetTimeout(this.abortController));
     if (this.memoryProvider) {
@@ -200,6 +200,8 @@ export class AgentCore {
       context.pending.push(observation('task time', new Date().toISOString() + `; timezone=${timezone}`));
       if (this.environment) context.pending.push(observation('environment', this.environment));
       this.observe(context, locale, timezone, message);
+      let stitchAttempts = 0;
+      const MAX_AUTO_STITCHES = 2;
       while (!signal.aborted) {
         const max = this.config.maxIterations + this.progress.extensionUsed * PROGRESS_CONFIG.extensionSize;
         if (this.state.iteration >= max) {
@@ -239,21 +241,43 @@ export class AgentCore {
         let streamed = false;
         const response = await client.create({ instructions, input, stream: true,
           tools: AGENT_TOOLS,
-          max_output_tokens: this.config.maxOutputTokens, prompt_cache_key: context.cacheKey }, signal,
+          max_output_tokens: this.config.maxOutputTokens, prompt_cache_key: context.cacheKey,
+          allowIncomplete: true }, signal,
           delta => { streamed = true; this.emit(id, { subType: 'stream_chunk', content: delta }); });
         signal.throwIfAborted();
         this.addUsage(totals, response, 'main');
+
+        if (response.status === 'incomplete') {
+          if (stitchAttempts >= MAX_AUTO_STITCHES) {
+            throw new ResponsesError('responses_incomplete');
+          }
+          stitchAttempts++;
+          context.accept(response, input);
+          this.resetTimeout(controller);
+          if (response.text.trim()) {
+            finalText = finalText ? `${finalText}\n${response.text.trim()}` : response.text.trim();
+          }
+          context.pending.push(observation(
+            'system continuation',
+            '上一次响应由于达到单次 Token 上限已阶段性截断，未完成的工具调用已被安全舍弃。请紧接上文继续，精简分析，直接推进必要的命令或输出最终结论。'
+          ));
+          this.emit(id, { subType: 'thinking', iteration: this.state.iteration });
+          this.state.iteration++;
+          continue;
+        }
+        stitchAttempts = 0;
+
         context.accept(response, input);
         this.resetTimeout(controller);
         const isTerminal = !response.calls.length;
         if (response.text.trim()) {
-          finalText = response.text.trim();
+          finalText = finalText ? `${finalText}\n${response.text.trim()}` : response.text.trim();
           if (isTerminal) {
-            this.emit(id, { subType: streamed ? 'stream_end' : 'response', content: response.text });
+            this.emit(id, { subType: streamed ? 'stream_end' : 'response', content: finalText });
           }
         }
         if (isTerminal) {
-          if (!response.text.trim()) throw new ResponsesError('responses_empty');
+          if (!finalText.trim()) throw new ResponsesError('responses_empty');
           outcome = 'completed';
           break;
         }

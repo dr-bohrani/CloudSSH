@@ -1,5 +1,9 @@
 import { normalizeAIBaseUrl } from '../ai-endpoint';
 import {
+  normalizeMobileShortcutsPayload,
+  SHORTCUTS_MAX_BYTES,
+} from '../mobile-shortcuts-schema';
+import {
   MAX_CUSTOM_THEMES,
   normalizeThemeData,
   normalizeUserThemePayload,
@@ -219,6 +223,12 @@ export default {
 
       if (url.pathname === '/api/user/theme') {
         return handleThemeRoute(request, env);
+      }
+
+      // ==================== 移动端快捷键配置 Routes (需认证) ====================
+
+      if (url.pathname === '/api/user/mobile-shortcuts') {
+        return handleMobileShortcutsRoute(request, env);
       }
 
       // ==================== known_hosts Routes (需认证) ====================
@@ -760,6 +770,84 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
   return Response.json({ error: 'Method not allowed' }, { status: 405 });
 }
 
+// ==================== 移动端快捷键配置 routes ====================
+
+async function handleMobileShortcutsRoute(request: Request, env: Env): Promise<Response> {
+  const user = await getAuthenticatedUser(request, env);
+  if (!user) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  const stub = getUserDBStub(env, user.github_id);
+
+  if (request.method === 'GET') {
+    return stub.fetch(
+      new Request(`http://internal/internal/mobile-shortcuts?user_id=${user.id}`, {
+        method: 'GET',
+      })
+    );
+  }
+
+  if (request.method === 'PUT') {
+    const origin = request.headers.get('Origin');
+    let requestOrigin: string | null = null;
+    try {
+      requestOrigin = new URL(request.url).origin;
+    } catch {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (origin && origin !== requestOrigin) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    let body: unknown;
+    try {
+      body = await request.json<unknown>();
+    } catch {
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+
+    const rawSerialized = JSON.stringify(body);
+    if (new TextEncoder().encode(rawSerialized).byteLength > SHORTCUTS_MAX_BYTES) {
+      return Response.json({ error: 'Shortcuts payload is too large' }, { status: 413 });
+    }
+
+    const normalized = normalizeMobileShortcutsPayload(body);
+    if (!normalized) {
+      return Response.json({ error: 'Invalid shortcuts data' }, { status: 400 });
+    }
+
+    return stub.fetch(
+      new Request('http://internal/internal/mobile-shortcuts', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id, shortcuts_data: JSON.stringify(normalized) }),
+      })
+    );
+  }
+
+  if (request.method === 'DELETE') {
+    const origin = request.headers.get('Origin');
+    let requestOrigin: string | null = null;
+    try {
+      requestOrigin = new URL(request.url).origin;
+    } catch {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (origin && origin !== requestOrigin) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    return stub.fetch(
+      new Request(`http://internal/internal/mobile-shortcuts?user_id=${user.id}`, {
+        method: 'DELETE',
+      })
+    );
+  }
+
+  return Response.json({ error: 'Method not allowed' }, { status: 405 });
+}
+
 // ==================== known_hosts routes ====================
 
 async function handleKnownHostsRoute(request: Request, url: URL, env: Env): Promise<Response> {
@@ -1125,6 +1213,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config'); // 防御：禁止匿名连接通过 HTTP 头注入配置
+  headers.delete('x-share-device-key');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -1163,6 +1252,7 @@ async function handleResumeSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config');
+  headers.delete('x-share-device-key');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -1316,8 +1406,9 @@ async function handleShareSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
-  // 认领时绑定的设备公钥由服务端链路下发（claim → ShareDO → consume），
-  // 客户端无法注入或替换，断线恢复时以此验签。
+  // Clear the external header even when claim did not bind a device.
+  // Only claim → ShareDO → consume may supply the authoritative resume key.
+  headers.delete('x-share-device-key');
   if (typeof devicePubKey === 'string' && devicePubKey) {
     headers.set('x-share-device-key', devicePubKey);
   }
@@ -1405,6 +1496,7 @@ async function handleTokenSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
+  headers.delete('x-share-device-key');
 
   const doRequest = new Request(doUrl.toString(), {
     headers: headers,
@@ -1433,5 +1525,8 @@ async function handleSFTPAttachConnection(request: Request, env: Env): Promise<R
 
   const doId = env.SSH_SESSION.idFromName(sessionName);
   const stub = env.SSH_SESSION.get(doId);
-  return stub.fetch(request);
+  const headers = new Headers(request.headers);
+  headers.delete('x-share-device-key');
+  headers.delete('x-ssh-config');
+  return stub.fetch(new Request(request, { headers }));
 }
