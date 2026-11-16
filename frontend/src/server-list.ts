@@ -1,4 +1,5 @@
 import { readApiJson } from './api-errors';
+import type { AppConfig } from './app-bootstrap';
 import { copyTextToClipboard } from './clipboard';
 import { isValidTunnelHostname, maskIPAddress } from './host-display';
 import { getLocale, onLocaleChange, t } from './i18n';
@@ -209,11 +210,14 @@ export class ServerList {
   constructor(
     user: UserInfo,
     onLogout: () => void,
-    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void
+    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void,
+    config: AppConfig
   ) {
     this.user = user;
     this.onLogout = onLogout;
     this.onConnect = onConnect;
+    this.sharingEnabled = config.sshSharingEnabled === true;
+    this.cfSshCaEnabled = config.authMode === 'cf_access';
     try {
       const savedSort = localStorage.getItem(SERVER_SORT_STORAGE_KEY) as ServerSortMode | null;
       if (savedSort && ['recent', 'updated', 'created', 'name'].includes(savedSort)) {
@@ -229,8 +233,9 @@ export class ServerList {
   private async init(): Promise<void> {
     this.renderUserInfo();
     this.bindEvents();
+    this.applyCfSshCaAvailability();
     this.renderSkeletonGrid();
-    await Promise.all([this.fetchSharingConfig(), this.fetchServers()]);
+    await this.fetchServers();
     this.renderServerGrid();
 
     // 设置用户空间的版权年份
@@ -433,24 +438,6 @@ export class ServerList {
       console.error('Failed to fetch servers:', e);
       this.servers = [];
       this.renderServerGrid();
-    }
-  }
-
-  private async fetchSharingConfig(): Promise<void> {
-    try {
-      const response = await fetch('/api/config');
-      if (!response.ok) return;
-      const config = (await response.json()) as {
-        sshSharingEnabled?: boolean;
-        authMode?: string;
-      };
-      this.sharingEnabled = config.sshSharingEnabled === true;
-      this.cfSshCaEnabled = config.authMode === 'cf_access';
-      this.applyCfSshCaAvailability();
-    } catch {
-      this.sharingEnabled = false;
-      this.cfSshCaEnabled = false;
-      this.applyCfSshCaAvailability();
     }
   }
 
@@ -1009,6 +996,8 @@ export class ServerList {
 
     modal.classList.remove('hidden');
     modal.classList.add('flex');
+    const fields = modal.querySelector<HTMLElement>('.server-modal-fields');
+    if (fields) fields.scrollTop = 0;
 
     // Focus synchronously once visible: a delayed callback can steal focus from a
     // field the user has already started editing, or from a newer dialog.
@@ -1062,8 +1051,7 @@ export class ServerList {
     // 隐藏时同步移除 required，避免空值阻断表单校验（保存时端口回落 22，仅作存储记录）
     if (portField) portField.style.display = isTunnel ? 'none' : '';
     if (portInput) portInput.required = !isTunnel;
-    hostField?.classList.toggle('sm:col-span-4', isTunnel);
-    hostField?.classList.toggle('sm:col-span-3', !isTunnel);
+    hostField?.classList.toggle('ssh-host-field-wide', isTunnel);
 
     this.updateRegionControls();
   }
