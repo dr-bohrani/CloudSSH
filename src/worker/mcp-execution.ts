@@ -2,11 +2,14 @@ import type { Env, SSHConnectionConfig } from '../types';
 import {
   MCP_CONNECTION_IDLE_MS,
   MCP_OPERATION_MS,
+  isMcpFailureReason,
   mcpHash,
   mcpTokenRoute,
   type McpActivity,
   type McpPrincipal,
 } from '../mcp-schema';
+import { SshExecError } from '../ssh/exec-error';
+import { isRestrictedTcpPort } from '../tcp-port-policy';
 import { checkHostResolved } from './dns-check';
 import { SSHSession, type SSHSessionClient } from './ssh-session';
 import { isValidTunnelHostname, TunnelWebSocketStream } from './tunnel-stream';
@@ -17,6 +20,7 @@ import { mcpList, mcpRead, mcpWrite, withMcpSftp } from './mcp-sftp';
 
 type Connection = {
   hash: string;
+  jumpIds?: number[];
   sessions: SSHSession[];
   transports: { close(): void }[];
   final?: SSHSession;
@@ -25,12 +29,9 @@ type Connection = {
   expiresAt: number;
   controller?: AbortController;
 };
-const BLOCKED_PORTS = [
-  23, 80, 443, 25, 465, 587, 110, 143, 993, 995, 3306, 5432, 6379, 9200, 11211, 27017, 5060,
-];
 const silentClient: SSHSessionClient = { readyState: 1, send() {}, close() {} };
 function closeConnection(connection: Connection) {
-  connection.controller?.abort();
+  connection.controller?.abort(new Error('operation_cancelled'));
   for (const session of [...connection.sessions].reverse()) session.close(true);
   for (const transport of connection.transports) {
     try {
@@ -66,12 +67,19 @@ export class MCPExecutionDO {
     if (this.connections.size) await this.state.storage.setAlarm(now + MCP_CONNECTION_IDLE_MS);
   }
   async fetch(request: Request): Promise<Response> {
-    if (new URL(request.url).pathname === '/invalidate') {
-      for (const connection of this.connections.values()) closeConnection(connection);
-      this.connections.clear();
-      await this.state.storage.deleteAlarm();
+    const path = new URL(request.url).pathname;
+    const invalidate = /^\/invalidate(?:\/([1-9]\d*))?$/.exec(path);
+    if (request.method === 'POST' && invalidate) {
+      const serverId = invalidate[1] ? Number(invalidate[1]) : null;
+      for (const [id, connection] of this.connections) {
+        if (serverId !== null && id !== serverId && !connection.jumpIds?.includes(serverId)) continue;
+        this.connections.delete(id);
+        closeConnection(connection);
+      }
+      if (!this.connections.size) await this.state.storage.deleteAlarm();
       return Response.json({ success: true });
     }
+    if (request.method !== 'POST' || path !== '/execute') return new Response(null, { status: 404 });
     const body = await request.json<{
       token: string;
       modeTag: string;
@@ -133,14 +141,16 @@ export class MCPExecutionDO {
       }
     };
     controller.signal.addEventListener('abort', onAbort, { once: true });
-    const onDisconnect = () => controller.abort();
+    const onDisconnect = () => controller.abort(new Error('operation_cancelled'));
     request.signal.addEventListener('abort', onDisconnect, { once: true });
-    if (request.signal.aborted) controller.abort();
+    if (request.signal.aborted) onDisconnect();
     const timer = setTimeout(
-      () => controller.abort(),
+      () => controller.abort(new Error('operation_timeout')),
       Math.max(1, Math.min(MCP_OPERATION_MS, principal.expiresAt - Date.now()))
     );
     let dispatched = false;
+    let exitCode: number | undefined;
+    let partialExec: { stdout: string; stderr: string; exitCode: number; truncated: boolean } | undefined;
     const activity: McpActivity = {
       id: crypto.randomUUID(),
       client: principal.name,
@@ -174,6 +184,7 @@ export class MCPExecutionDO {
         }
         const config = await configResponse.json<SSHConnectionConfig>();
         controller.signal.throwIfAborted();
+        current.jumpIds = config.jumpHosts?.map((hop) => hop.serverId);
         const hash = await mcpHash(JSON.stringify(config));
         controller.signal.throwIfAborted();
         if (current.hash !== hash || !current.final?.isOperational()) {
@@ -216,13 +227,19 @@ export class MCPExecutionDO {
             value.length > 32_000
               ? `${value.slice(0, 8000)}\n[output truncated]\n${value.slice(-24_000)}`
               : value;
-          return {
+          const captured = {
             stdout: cap(result.stdout),
             stderr: cap(result.stderr),
             exitCode: result.exitCode,
             truncated:
               !!result.truncated || result.stdout.length > 32_000 || result.stderr.length > 32_000,
           };
+          if (result.exitCode < 0) {
+            partialExec = captured;
+            throw new SshExecError('exec_result_unknown', 'unknown');
+          }
+          exitCode = captured.exitCode;
+          return captured;
         }
         return withMcpSftp(current.final!, (sftp) => {
           if (body.tool === 'sftp_list')
@@ -236,25 +253,24 @@ export class MCPExecutionDO {
       const result = await Promise.race([
         operation,
         new Promise<never>((_, reject) => {
-          if (controller.signal.aborted) reject(new Error('operation_timeout'));
-          else
-            controller.signal.addEventListener(
-              'abort',
-              () => reject(new Error('operation_timeout')),
-              { once: true }
-            );
+          const rejectAbort = () => reject(controller.signal.reason);
+          if (controller.signal.aborted) rejectAbort();
+          else controller.signal.addEventListener('abort', rejectAbort, { once: true });
         }),
       ]);
-      activity.status = 'success';
+      activity.status = exitCode !== undefined && exitCode !== 0 ? 'failed' : 'success';
       return Response.json(result);
     } catch (error) {
       failed = true;
-      activity.status = dispatched ? 'unknown' : 'error';
+      const execError = body.tool === 'ssh_exec' && error instanceof SshExecError ? error : undefined;
+      const outcome = execError?.outcome ?? (dispatched ? 'unknown' : 'not_executed');
+      activity.status = outcome === 'unknown' ? 'unknown' : 'error';
       const allowed = [
         'host_verification_required',
         'interactive_auth_required',
         'unauthorized',
         'operation_timeout',
+        'operation_cancelled',
         'expected_hash_required',
         'file_changed',
         'atomic_replace_unsupported',
@@ -264,16 +280,20 @@ export class MCPExecutionDO {
         'utf8_required',
         'text_too_large_or_binary',
       ];
-      const code =
-        error instanceof Error && allowed.includes(error.message)
-          ? error.message
-          : 'operation_failed';
+      const code = execError?.code ?? (
+        error instanceof Error && allowed.includes(error.message) ? error.message : 'operation_failed'
+      );
+      activity.failureReason = code === 'operation_failed' && !dispatched
+        ? 'connection_failed'
+        : isMcpFailureReason(code) ? code : undefined;
       return Response.json(
         {
           error: code,
-          status: dispatched ? 'unknown' : 'not_executed',
-          instruction:
-            'Do not automatically retry. Inspect remote state; cancellation is not rollback.',
+          status: outcome,
+          ...(code === 'exec_result_unknown' ? partialExec : undefined),
+          instruction: outcome === 'unknown'
+            ? 'Do not automatically retry. Inspect remote state; cancellation is not rollback.'
+            : 'The requested operation was not executed.',
         },
         { status: 409 }
       );
@@ -323,7 +343,7 @@ export class MCPExecutionDO {
           !Number.isInteger(node.port) ||
           node.port < 1 ||
           node.port > 65535 ||
-          BLOCKED_PORTS.includes(node.port)
+          isRestrictedTcpPort(node.port)
         )
           throw new Error('blocked_port');
       }
@@ -363,7 +383,6 @@ export class MCPExecutionDO {
         client,
         transport,
         node,
-        true,
         false,
         undefined,
         undefined,
